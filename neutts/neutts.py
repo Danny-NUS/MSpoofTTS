@@ -213,7 +213,7 @@ class NeuTTS:
                     " 'neuphonic/neucodec-onnx-decoder'."
                 )
 
-    def infer(self, text: str, ref_codes: np.ndarray | torch.Tensor, ref_text: str) -> np.ndarray:
+    def infer(self, text: str, ref_codes: np.ndarray | torch.Tensor, ref_text: str, return_codes: bool = False) -> np.ndarray:
         """
         Perform inference to generate speech from text using the TTS model and reference audio.
 
@@ -240,6 +240,8 @@ class NeuTTS:
             else self.watermarker.apply_watermark(wav, sample_rate=24_000)
         )
 
+        if return_codes:
+            return watermarked_wav, output_str
         return watermarked_wav
 
     def infer_stream(

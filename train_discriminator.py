@@ -234,11 +234,11 @@ class TokenSpoofDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
 
     def setup(self, stage=None):
-        real_train = load_kaldi_dataset(self.real_root, 0, 1500)
-        real_test  = load_kaldi_dataset(self.real_root, 1500, 2000)
+        real_train = load_kaldi_dataset(self.real_root, 0, 8000)
+        real_test  = load_kaldi_dataset(self.real_root, 8000, 9000)
 
-        syn_train = load_kaldi_dataset(self.syn_root, 0, 4500)
-        syn_test  = load_kaldi_dataset(self.syn_root, 4500, 6000)
+        syn_train = load_kaldi_dataset(self.syn_root, 0, 24000)
+        syn_test  = load_kaldi_dataset(self.syn_root, 24000, 27000)
 
         real_train_ds = TokenSpoofDataset(real_train, label=1)
         syn_train_ds  = TokenSpoofDataset(syn_train,  label=0)
@@ -292,7 +292,7 @@ def main():
     dm = TokenSpoofDataModule(
         real_root=REAL_ROOT,
         syn_root=SYN_ROOT,
-        batch_size=16,
+        batch_size=20,
     )
 
     logger = TensorBoardLogger(
@@ -303,12 +303,13 @@ def main():
     trainer = pl.Trainer(
         accelerator="gpu",
         devices=1,
-        max_epochs=20,
+        max_epochs=5,
         logger=logger,
         log_every_n_steps=10,
     )
 
     print("-----------TRAINING--------------")
+    print("Number of samples: 4000 + 12000")
 
     trainer.fit(lit_model, dm)
     trainer.test(lit_model, dm)

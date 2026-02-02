@@ -220,7 +220,7 @@ def build_synthetic_dataset(ds):
                     ref_wav_path = REAL_ROOT / "wav" / f"{ref['id']}.wav"
                     ref_codes = tts.encode_reference(str(ref_wav_path))
 
-                    wav_24k = tts.infer(src_text, ref_codes, ref["text_normalized"])
+                    wav_24k, code_str = tts.infer(src_text, ref_codes, ref["text_normalized"], return_codes=True)
                     wav_16k = resample_24k_to_16k(wav_24k)
 
                     wav_path = SYN_ROOT / "wav" / f"{new_id}.wav"
@@ -228,8 +228,8 @@ def build_synthetic_dataset(ds):
 
                     save_wav(wav_path, wav_16k, 16000)
 
-                    code_ids = tts.encode_reference(str(wav_path))
-                    code_str = speech_ids_to_codes(code_ids)
+                    # code_ids = tts.encode_reference(str(wav_path))
+                    # code_str = speech_ids_to_codes(code_ids)
 
                     with open(codes_path, "w") as f:
                         f.write(code_str)
@@ -268,5 +268,5 @@ if __name__ == "__main__":
     # DEBUG: limit size (remove later)
     # ds = ds.select(range(min(8, len(ds))))
 
-    build_real_dataset(ds)
+    # build_real_dataset(ds)
     build_synthetic_dataset(ds)
