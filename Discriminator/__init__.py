@@ -1,1 +1,1 @@
-from .model import TokenDiscriminator
+from .model import TokenDiscriminator, SegmentTokenDiscriminator

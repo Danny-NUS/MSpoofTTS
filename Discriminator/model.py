@@ -225,3 +225,65 @@ class TokenDiscriminator(nn.Module):
         # ---- Classification ----
         logits = self.classifier(h_mean).squeeze(-1)  # [B]
         return logits
+
+
+class SegmentTokenDiscriminator(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int = 65536,
+        d_model: int = 256,
+        nhead: int = 8,
+        num_layers: int = 4,
+        dim_feedforward: int = 1024,
+        dropout: float = 0.1,
+        segment_len: int = 50,
+    ):
+        super().__init__()
+
+        self.segment_len = segment_len
+
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.positional_encoding = SinusoidalPositionalEncoding(
+            d_model=d_model, max_len=segment_len
+        )
+
+        self.encoder = ConformerEncoder(
+            num_layers=num_layers,
+            d_model=d_model,
+            nhead=nhead,
+            dim_ff=dim_feedforward,
+            dropout=dropout,
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1),
+        )
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """
+        tokens: LongTensor of shape [B, 50]
+        Returns:
+            logits: Tensor of shape [B]
+        """
+
+        # ---- Sanity check (optional but nice) ----
+        assert tokens.dim() == 2 and tokens.size(1) == self.segment_len, \
+            f"Expected [B, {self.segment_len}] tokens, got {tokens.shape}"
+
+        # ---- Embedding + PE ----
+        x = self.embedding(tokens)        # [B, 50, D]
+        x = self.positional_encoding(x)   # [B, 50, D]
+
+        # ---- Conformer Encoder ----
+        # No padding mask needed
+        h = self.encoder(x, padding_mask=None)  # [B, 50, D]
+
+        # ---- Mean pooling over segment ----
+        h_mean = h.mean(dim=1)  # [B, D]
+
+        # ---- Classification ----
+        logits = self.classifier(h_mean).squeeze(-1)  # [B]
+        return logits

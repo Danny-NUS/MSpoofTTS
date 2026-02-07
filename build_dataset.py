@@ -29,8 +29,8 @@ from neutts import NeuTTS
 # CONFIG
 # =========================
 
-REAL_ROOT = Path("/data2/minh_duc/from_hf/libritts/train.clean.100")
-SYN_ROOT  = Path("/data2/minh_duc/neutts/libritts/train.clean.100")
+REAL_ROOT = Path("/data2/minh_duc/from_hf/libritts/test.clean")
+SYN_ROOT  = Path("/data2/minh_duc/neutts/libritts/test.clean")
 
 N_SYN_PER_UTT = 3
 SEED = 42
@@ -258,15 +258,15 @@ def build_synthetic_dataset(ds):
 # =========================
 
 if __name__ == "__main__":
-    print("Loading LibriTTS train.clean.100 once...")
+    print("Loading LibriTTS test.clean once...")
     ds = load_dataset(
         "mythicinfinity/libritts",
         "clean",
-        split="train.clean.100"
+        split="test.clean"
     ).cast_column("audio", Audio(sampling_rate=16000))
 
     # DEBUG: limit size (remove later)
     # ds = ds.select(range(min(8, len(ds))))
 
-    # build_real_dataset(ds)
+    build_real_dataset(ds)
     build_synthetic_dataset(ds)
