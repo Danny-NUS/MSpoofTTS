@@ -33,7 +33,7 @@ os.makedirs(SAVE_ROOT, exist_ok=True)
 # SEGMENT CONFIG
 # ============================================================
 
-SEGMENT_LEN = 25
+SEGMENT_LEN = 10
 
 # ============================================================
 # TOKEN PARSER
@@ -331,7 +331,7 @@ def main():
 
     logger = TensorBoardLogger(
         save_dir=SAVE_ROOT,
-        name="Segment_discriminator_len25",
+        name="Segment_discriminator_len10",
     )
 
     trainer = pl.Trainer(

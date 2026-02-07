@@ -1,1 +1,2 @@
-from .model import TokenDiscriminator, SegmentTokenDiscriminator
+from .segment import SegmentTokenDiscriminator
+from .utterance import TokenDiscriminator
