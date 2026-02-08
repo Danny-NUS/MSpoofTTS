@@ -268,5 +268,5 @@ if __name__ == "__main__":
     # DEBUG: limit size (remove later)
     # ds = ds.select(range(min(8, len(ds))))
 
-    build_real_dataset(ds)
+    # build_real_dataset(ds)
     build_synthetic_dataset(ds)
