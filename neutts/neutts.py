@@ -70,6 +70,87 @@ def _linear_overlap_add(frames: list[np.ndarray], stride: int) -> np.ndarray:
     return out / sum_weight
 
 
+def _sample_top_k(
+        logits: torch.Tensor,
+        top_k: int,
+        temperature: float,
+    ) -> torch.Tensor:
+        """
+        logits: (vocab,)
+        returns: sampled token id (scalar tensor)
+        """
+        if temperature != 1.0:
+            logits = logits / temperature
+
+        if top_k is not None and top_k > 0:
+            values, indices = torch.topk(logits, top_k)
+            probs = torch.softmax(values, dim=-1)
+            sampled = torch.multinomial(probs, num_samples=1)
+            return indices[sampled]
+        else:
+            probs = torch.softmax(logits, dim=-1)
+            return torch.multinomial(probs, num_samples=1)
+
+
+def nucleus_sampling(
+    weighted_scores: torch.Tensor,
+    top_p: float = 0.8,
+    top_k: int = 25,
+) -> int:
+    probs = torch.softmax(weighted_scores, dim=0)
+    sorted_probs, sorted_idx = probs.sort(descending=True, stable=True)
+
+    cum_prob = 0.0
+    kept_probs = []
+    kept_idx = []
+
+    for i in range(len(sorted_idx)):
+        if cum_prob < top_p and len(kept_probs) < top_k:
+            cum_prob += sorted_probs[i].item()
+            kept_probs.append(sorted_probs[i])
+            kept_idx.append(sorted_idx[i])
+        else:
+            break
+
+    kept_probs = torch.stack(kept_probs)
+    kept_idx = torch.stack(kept_idx)
+
+    sampled = torch.multinomial(kept_probs, 1)
+    return kept_idx[sampled].item()
+
+
+def random_sampling(
+    weighted_scores: torch.Tensor,
+) -> int:
+    probs = torch.softmax(weighted_scores, dim=0)
+    return torch.multinomial(probs, 1).item()
+
+
+def ras_sampling(
+    weighted_scores: torch.Tensor,
+    decoded_tokens: list[int],
+    *,
+    top_p: float = 0.8,
+    top_k: int = 25,
+    win_size: int = 10,
+    tau_r: float = 0.1,
+) -> int:
+    """
+    Repetition Aware Sampling (VALL-E 2 style)
+    """
+    top_id = nucleus_sampling(weighted_scores, top_p=top_p, top_k=top_k)
+
+    if len(decoded_tokens) > 0:
+        window = decoded_tokens[-win_size:]
+        rep_num = (torch.tensor(window, device=weighted_scores.device) == top_id).sum().item()
+        if rep_num >= win_size * tau_r:
+            weighted_scores = weighted_scores.clone()
+            weighted_scores[top_id] = -float("inf")
+            top_id = random_sampling(weighted_scores)
+
+    return top_id
+
+
 class NeuTTS:
 
     def __init__(
@@ -213,7 +294,8 @@ class NeuTTS:
                     " 'neuphonic/neucodec-onnx-decoder'."
                 )
 
-    def infer(self, text: str, ref_codes: np.ndarray | torch.Tensor, ref_text: str, return_codes: bool = False) -> np.ndarray:
+    def infer(self, text: str, ref_codes: np.ndarray | torch.Tensor, ref_text: str, 
+              return_codes: bool = False, sampling_scheme: str = "orig") -> np.ndarray:
         """
         Perform inference to generate speech from text using the TTS model and reference audio.
 
@@ -230,7 +312,7 @@ class NeuTTS:
             output_str = self._infer_ggml(ref_codes, ref_text, text)
         else:
             prompt_ids = self._apply_chat_template(ref_codes, ref_text, text)
-            output_str = self._infer_torch(prompt_ids)
+            output_str = self._infer_torch(prompt_ids, sampling_scheme)
 
         # Decode
         wav = self._decode(output_str)
@@ -332,21 +414,191 @@ class NeuTTS:
         ids = ids[:speech_replace_idx] + [speech_gen_start] + list(codes)
 
         return ids
+    
+    @torch.no_grad()
+    def _backbone_generate(
+        self,
+        prompt_tensor: torch.Tensor,
+        *,
+        max_length: int,
+        eos_token_id: int,
+        do_sample: bool = True,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        use_cache: bool = True,
+        min_new_tokens: int = 0,
+    ) -> torch.Tensor:
+        """
+        Explicit autoregressive generation for HF LLaMA-style models.
 
-    def _infer_torch(self, prompt_ids: list[int]) -> str:
+        Args:
+            prompt_tensor: (1, T)
+        Returns:
+            output_tokens: (1, T + N)
+        """
+        device = prompt_tensor.device
+        input_ids = prompt_tensor
+        past_key_values = None
+
+        generated = []
+        cur_len = input_ids.shape[1]
+
+        for step in range(max_length - cur_len):
+            if past_key_values is None:
+                outputs = self.backbone(
+                    input_ids=input_ids,
+                    use_cache=use_cache,
+                )
+            else:
+                outputs = self.backbone(
+                    input_ids=input_ids[:, -1:],  # only last token
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                )
+
+            logits = outputs.logits[:, -1, :]  # (1, vocab)
+            past_key_values = outputs.past_key_values
+
+            if do_sample:
+                next_token = _sample_top_k(
+                    logits.squeeze(0),
+                    top_k=top_k,
+                    temperature=temperature,
+                )
+            else:
+                next_token = torch.argmax(logits, dim=-1)
+
+            next_token = next_token.view(1, 1)
+            generated.append(next_token)
+
+            # EOS handling (respect min_new_tokens)
+            if (
+                next_token.item() == eos_token_id
+                and len(generated) >= min_new_tokens
+            ):
+                break
+
+            input_ids = next_token
+
+        if generated:
+            generated = torch.cat(generated, dim=1)
+            return torch.cat([prompt_tensor, generated], dim=1)
+        else:
+            return prompt_tensor
+
+    @torch.no_grad()
+    def _ras_generate(
+        self,
+        prompt_tensor: torch.Tensor,
+        *,
+        max_length: int,
+        eos_token_id: int,
+        temperature: float = 1.0,
+        use_cache: bool = True,
+        min_new_tokens: int = 0,
+        # RAS params
+        top_p: float = 0.8,
+        top_k: int = 25,
+        win_size: int = 10,
+        tau_r: float = 0.1,
+    ) -> torch.Tensor:
+        """
+        Explicit autoregressive generation with Repetition Aware Sampling (RAS).
+        """
+        input_ids = prompt_tensor
+        past_key_values = None
+
+        generated = []
+        decoded_tokens: list[int] = []
+
+        cur_len = input_ids.shape[1]
+
+        for step in range(max_length - cur_len):
+            if past_key_values is None:
+                outputs = self.backbone(
+                    input_ids=input_ids,
+                    use_cache=use_cache,
+                )
+            else:
+                outputs = self.backbone(
+                    input_ids=input_ids[:, -1:],
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                )
+
+            logits = outputs.logits[:, -1, :]  # (1, vocab)
+            past_key_values = outputs.past_key_values
+
+            scores = logits.squeeze(0)
+
+            if temperature != 1.0:
+                scores = scores / temperature
+
+            next_id = ras_sampling(
+                scores,
+                decoded_tokens,
+                top_p=top_p,
+                top_k=top_k,
+                win_size=win_size,
+                tau_r=tau_r,
+            )
+
+            next_token = torch.tensor([[next_id]], device=prompt_tensor.device)
+
+            generated.append(next_token)
+            decoded_tokens.append(next_id)
+
+            if next_id == eos_token_id and len(decoded_tokens) >= min_new_tokens:
+                break
+
+            input_ids = next_token
+
+        if generated:
+            generated = torch.cat(generated, dim=1)
+            return torch.cat([prompt_tensor, generated], dim=1)
+        else:
+            return prompt_tensor
+
+
+    def _infer_torch(self, prompt_ids: list[int], sampling_scheme: str = "orig") -> str:
         prompt_tensor = torch.tensor(prompt_ids).unsqueeze(0).to(self.backbone.device)
         speech_end_id = self.tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_END|>")
         with torch.no_grad():
-            output_tokens = self.backbone.generate(
-                prompt_tensor,
-                max_length=self.max_context,
-                eos_token_id=speech_end_id,
-                do_sample=True,
-                temperature=1.0,
-                top_k=50,
-                use_cache=True,
-                min_new_tokens=50,
-            )
+            if sampling_scheme == "orig":
+                output_tokens = self.backbone.generate(
+                    prompt_tensor,
+                    max_length=self.max_context,
+                    eos_token_id=speech_end_id,
+                    do_sample=True,
+                    temperature=1.0,
+                    top_k=50,
+                    use_cache=True,
+                    min_new_tokens=50,
+                )
+            elif sampling_scheme == "recon":
+                output_tokens = self._backbone_generate(
+                    prompt_tensor,
+                    max_length=self.max_context,
+                    eos_token_id=speech_end_id,
+                    do_sample=True,
+                    temperature=1.0,
+                    top_k=50,
+                    use_cache=True,
+                    min_new_tokens=50,
+                )
+            elif sampling_scheme == "ras_k50_win25":
+                output_tokens = self._ras_generate(
+                    prompt_tensor,
+                    max_length=self.max_context,
+                    eos_token_id=speech_end_id,
+                    temperature=1.0,
+                    min_new_tokens=50,
+                    top_p=0.8,
+                    top_k=50,
+                    win_size=25,
+                    tau_r=0.1,
+                )
+
         input_length = prompt_tensor.shape[-1]
         output_str = self.tokenizer.decode(
             output_tokens[0, input_length:].cpu().numpy().tolist(), add_special_tokens=False

@@ -145,28 +145,34 @@ class WhisperASR:
 # BUILD + EVAL
 # =========================
 
+sampling_schemes = ["orig", "recon", "ras_k50_win25"]
+
 def build_and_eval(examples):
     asr_dir = ensure_dirs()
 
     # ---- files ----
-    wav_scp = open(SYN_ROOT / "wav.scp", "a")
-    text_f  = open(SYN_ROOT / "text", "a")
-    log_f   = open(SYN_ROOT / "process.log", "a")
-    asr_f   = open(asr_dir / "results.jsonl", "a")
+    log_f = open(SYN_ROOT / "process.log", "a")
+    asr_f = open(asr_dir / "results.jsonl", "a")
 
-    # ---- metrics accumulators ----
-    wer_gt_list  = []
-    wer_syn_list = []
-    cer_gt_list  = []
-    cer_syn_list = []
+    # ---- per-scheme accumulators ----
+    scheme_stats = {
+        s: {
+            "wer": [],
+            "cer": []
+        }
+        for s in sampling_schemes
+    }
 
-    # ---- write ASR metadata once ----
+    wer_gt_list = []
+    cer_gt_list = []
+
+    # ---- metadata ----
     meta_path = asr_dir / "meta.json"
     meta = {
         "asr_model": ASR_TAG,
         "date": datetime.now().isoformat(timespec="seconds"),
-        "sampling_strategy": "neutts_default",
-        "notes": "GT vs SYN ASR evaluation",
+        "sampling_schemes": sampling_schemes,
+        "notes": "GT vs multi-scheme SYN ASR evaluation",
     }
 
     # ---- group by speaker ----
@@ -199,88 +205,91 @@ def build_and_eval(examples):
             )
 
             for ref in refs:
-                new_id = f"{src_id}_ref_{ref['utt_id']}"
-
                 try:
                     # ---- prepare ref wav ----
-                    tmp_ref = SYN_ROOT / "wav" / "_tmp_ref.wav"
+                    tmp_ref = SYN_ROOT / "_tmp_ref.wav"
                     save_wav(tmp_ref, ref["audio"], 16000)
 
-                    # ---- synthesis ----
                     ref_codes = tts.encode_reference(str(tmp_ref))
-                    wav_24k = tts.infer(
-                        src_text,
-                        ref_codes,
-                        ref["text"]
-                    )
-                    wav_16k = resample_24k_to_16k(wav_24k)
 
-                    wav_path = SYN_ROOT / "wav" / f"{new_id}.wav"
-                    save_wav(wav_path, wav_16k, 16000)
-
-                    # ---- ASR ----
-                    asr_gt_raw  = asr.transcribe(ex["audio"])
-                    asr_syn_raw = asr.transcribe(wav_16k)
-
-                    # ---- normalize ----
+                    # ---- GT ASR (once) ----
+                    asr_gt_raw = asr.transcribe(ex["audio"])
                     ref_n = normalize_text(src_text)
                     gt_n  = normalize_text(asr_gt_raw)
-                    syn_n = normalize_text(asr_syn_raw)
 
-                    # ---- metrics ----
-                    wer_gt  = wer(ref_n, gt_n)
-                    wer_syn = wer(ref_n, syn_n)
-                    cer_gt  = cer(ref_n, gt_n)
-                    cer_syn = cer(ref_n, syn_n)
+                    wer_gt = wer(ref_n, gt_n)
+                    cer_gt = cer(ref_n, gt_n)
 
                     wer_gt_list.append(wer_gt)
-                    wer_syn_list.append(wer_syn)
                     cer_gt_list.append(cer_gt)
-                    cer_syn_list.append(cer_syn)
 
-                    # ---- log JSON ----
                     record = {
                         "utt_id": src_id,
                         "speaker_id": spk,
                         "ref_text": src_text,
                         "asr_gt_text": asr_gt_raw,
-                        "asr_syn_text": asr_syn_raw,
-                        "wer_gt": wer_gt,
-                        "wer_syn": wer_syn,
-                        "cer_gt": cer_gt,
-                        "cer_syn": cer_syn,
+                        "schemes": {}
                     }
+
+                    # ---- per-scheme synthesis + ASR ----
+                    for scheme in sampling_schemes:
+                        scheme_dir = SYN_ROOT / scheme / "wav"
+                        scheme_dir.mkdir(parents=True, exist_ok=True)
+
+                        new_id = f"{src_id}_ref_{ref['utt_id']}_{scheme}"
+                        wav_path = scheme_dir / f"{new_id}.wav"
+
+                        wav_24k = tts.infer(
+                            src_text,
+                            ref_codes,
+                            ref["text"],
+                            sampling_scheme=scheme
+                        )
+                        wav_16k = resample_24k_to_16k(wav_24k)
+                        save_wav(wav_path, wav_16k, 16000)
+
+                        asr_syn_raw = asr.transcribe(wav_16k)
+                        syn_n = normalize_text(asr_syn_raw)
+
+                        wer_syn = wer(ref_n, syn_n)
+                        cer_syn = cer(ref_n, syn_n)
+
+                        scheme_stats[scheme]["wer"].append(wer_syn)
+                        scheme_stats[scheme]["cer"].append(cer_syn)
+
+                        record["schemes"][scheme] = {
+                            "asr_text": asr_syn_raw,
+                            "wer": wer_syn,
+                            "cer": cer_syn
+                        }
 
                     asr_f.write(json.dumps(record) + "\n")
                     asr_f.flush()
 
-                    wav_scp.write(f"{new_id} {wav_path}\n")
-                    text_f.write(f"{new_id} {src_text}\n")
-
-                    log_msg(log_f, f"OK {new_id}")
+                    log_msg(log_f, f"OK {src_id}")
 
                     tmp_ref.unlink(missing_ok=True)
 
                 except Exception as e:
-                    log_msg(log_f, f"FAIL {new_id} : {e}")
+                    log_msg(log_f, f"FAIL {src_id} : {e}")
 
-    # ---- finalize metadata with averages ----
-    if wer_gt_list:
-        meta.update({
-            "num_samples": len(wer_gt_list),
-            "avg_wer_gt":  mean(wer_gt_list),
-            "avg_wer_syn": mean(wer_syn_list),
-            "avg_cer_gt":  mean(cer_gt_list),
-            "avg_cer_syn": mean(cer_syn_list),
-            "avg_delta_wer": mean(wer_syn_list) - mean(wer_gt_list),
-            "avg_delta_cer": mean(cer_syn_list) - mean(cer_gt_list),
-        })
+    # ---- finalize metadata ----
+    meta["num_samples"] = len(wer_gt_list)
+    meta["avg_wer_gt"]  = mean(wer_gt_list)
+    meta["avg_cer_gt"]  = mean(cer_gt_list)
+
+    meta["schemes"] = {}
+    for s in sampling_schemes:
+        meta["schemes"][s] = {
+            "avg_wer": mean(scheme_stats[s]["wer"]),
+            "avg_cer": mean(scheme_stats[s]["cer"]),
+            "avg_delta_wer": mean(scheme_stats[s]["wer"]) - meta["avg_wer_gt"],
+            "avg_delta_cer": mean(scheme_stats[s]["cer"]) - meta["avg_cer_gt"],
+        }
 
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
 
-    wav_scp.close()
-    text_f.close()
     log_f.close()
     asr_f.close()
 
