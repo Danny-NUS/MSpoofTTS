@@ -11,13 +11,13 @@ class BaseTokenDiscriminator(nn.Module):
 
     def __init__(
         self,
-        vocab_size: int,
-        d_model: int,
-        nhead: int,
-        num_layers: int,
-        dim_feedforward: int,
-        dropout: float,
-        max_len: int,
+        vocab_size: int = 65636,
+        d_model: int = 256,
+        nhead: int = 8,
+        num_layers: int = 4,
+        dim_feedforward: int = 1024,
+        dropout: float = 0.1,
+        max_len: int = 50,
     ):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)

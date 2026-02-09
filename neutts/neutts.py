@@ -12,6 +12,8 @@ from phonemizer.backend import EspeakBackend
 from neucodec import NeuCodec, DistillNeuCodec
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+from Discriminator import SegmentTokenDiscriminator
+
 
 def _configure_espeak_library():
     """Auto-detect and configure espeak library on macOS."""
@@ -131,8 +133,8 @@ def ras_sampling(
     decoded_tokens: list[int],
     *,
     top_p: float = 0.8,
-    top_k: int = 25,
-    win_size: int = 10,
+    top_k: int = 50,
+    win_size: int = 20,
     tau_r: float = 0.1,
 ) -> int:
     """
@@ -200,6 +202,26 @@ class NeuTTS:
                 "Install with: pip install perth>=0.2.0"
             )
             self.watermarker = None
+
+        checkpoint_path = "/data2/minh_duc/TTS_spoofing/Segment_discriminator_len50/version_0/checkpoints/epoch=4-step=29675.ckpt"
+        self.discriminator = SegmentTokenDiscriminator(segment_len=50,
+                                vocab_size=65536,
+                                d_model=256,
+                                nhead=8,
+                                num_layers=4,
+                                dim_feedforward=1024,
+                                dropout=0.1,
+                                )
+        state = torch.load(checkpoint_path, map_location="cpu")
+        self.discriminator.load_state_dict(state["model_state_dict"])
+        self.discriminator.eval()
+        self.discriminator.to(self.backbone.device)
+
+        # Speech token range (verified contiguous)
+        self.speech_start_id = 128262
+        self.speech_vocab_size = 65536
+        self.speech_end_id = self.speech_start_id + self.speech_vocab_size # exclusive
+
 
     def _load_backbone(self, backbone_repo, backbone_device):
         print(f"Loading backbone from: {backbone_repo} on {backbone_device} ...")
@@ -486,6 +508,31 @@ class NeuTTS:
         else:
             return prompt_tensor
 
+    def _mask_to_speech_only(
+        self,
+        scores: torch.Tensor,     # (vocab,)
+        eos_token_id: int,
+    ) -> torch.Tensor:
+        """
+        Keep only speech tokens [speech_start_id, speech_end_id) and eos_token_id.
+        Everything else -> -inf.
+        """
+        masked = scores.clone()
+        masked[:] = -float("inf")
+
+        # allow speech range
+        masked[self.speech_start_id : self.speech_end_id] = scores[self.speech_start_id : self.speech_end_id]
+
+        # allow EOS (may be just below speech_start_id like 128261)
+        masked[eos_token_id] = scores[eos_token_id]
+
+        return masked
+    
+    def _lm_to_speech_id_or_none(self, lm_id: int) -> int | None:
+        if self.speech_start_id <= lm_id < self.speech_end_id:
+            return lm_id - self.speech_start_id
+        return None
+
     @torch.no_grad()
     def _ras_generate(
         self,
@@ -498,27 +545,27 @@ class NeuTTS:
         min_new_tokens: int = 0,
         # RAS params
         top_p: float = 0.8,
-        top_k: int = 25,
-        win_size: int = 10,
+        top_k: int = 50,
+        win_size: int = 20,
         tau_r: float = 0.1,
     ) -> torch.Tensor:
         """
-        Explicit autoregressive generation with Repetition Aware Sampling (RAS).
+        Explicit autoregressive generation with Repetition Aware Sampling (RAS),
+        restricted to speech tokens + eos_token_id.
         """
         input_ids = prompt_tensor
         past_key_values = None
 
         generated = []
-        decoded_tokens: list[int] = []
+
+        # Track repetition in *speech-id* space (0..65535)
+        decoded_speech_ids: list[int] = []
 
         cur_len = input_ids.shape[1]
 
-        for step in range(max_length - cur_len):
+        for _ in range(max_length - cur_len):
             if past_key_values is None:
-                outputs = self.backbone(
-                    input_ids=input_ids,
-                    use_cache=use_cache,
-                )
+                outputs = self.backbone(input_ids=input_ids, use_cache=use_cache)
             else:
                 outputs = self.backbone(
                     input_ids=input_ids[:, -1:],
@@ -534,9 +581,16 @@ class NeuTTS:
             if temperature != 1.0:
                 scores = scores / temperature
 
+            # ---- restrict to speech range + EOS ----
+            scores = self._mask_to_speech_only(scores, eos_token_id=eos_token_id)
+
+            # ---- RAS on masked scores ----
             next_id = ras_sampling(
                 scores,
-                decoded_tokens,
+                # IMPORTANT: repetition window in speech-id space,
+                # but ras_sampling expects same ID space as scores.
+                # So we pass LM IDs history only for *speech tokens*:
+                [sid + self.speech_start_id for sid in decoded_speech_ids],
                 top_p=top_p,
                 top_k=top_k,
                 win_size=win_size,
@@ -544,21 +598,307 @@ class NeuTTS:
             )
 
             next_token = torch.tensor([[next_id]], device=prompt_tensor.device)
-
             generated.append(next_token)
-            decoded_tokens.append(next_id)
 
-            if next_id == eos_token_id and len(decoded_tokens) >= min_new_tokens:
+            # update speech repetition history (speech tokens only)
+            sid = self._lm_to_speech_id_or_none(next_id)
+            if sid is not None:
+                decoded_speech_ids.append(sid)
+
+            # stop on EOS once min_new_tokens satisfied
+            if next_id == eos_token_id and len(generated) >= min_new_tokens:
                 break
 
             input_ids = next_token
 
         if generated:
-            generated = torch.cat(generated, dim=1)
-            return torch.cat([prompt_tensor, generated], dim=1)
+            gen = torch.cat(generated, dim=1)
+            return torch.cat([prompt_tensor, gen], dim=1)
         else:
             return prompt_tensor
 
+    @torch.no_grad()
+    def _generate_chunk(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        max_new_tokens: int,
+        eos_token_id: int,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        past_key_values=None,
+    ):
+        generated = []
+        pkv = past_key_values
+
+        for _ in range(max_new_tokens):
+            outputs = self.backbone(
+                input_ids=input_ids if pkv is None else input_ids[:, -1:],
+                past_key_values=pkv,
+                use_cache=True,
+            )
+            logits = outputs.logits[:, -1, :]
+            pkv = outputs.past_key_values
+
+            logits = logits / temperature
+            if top_k > 0:
+                v, idx = torch.topk(logits, top_k)
+                probs = torch.softmax(v, dim=-1)
+                next_id = idx[0, torch.multinomial(probs[0], 1)]
+            else:
+                probs = torch.softmax(logits, dim=-1)
+                next_id = torch.multinomial(probs, 1)
+
+            next_id = next_id.view(1, 1)
+            generated.append(next_id)
+            input_ids = next_id
+
+            if next_id.item() == eos_token_id:
+                break
+
+        if not generated:
+            return None, past_key_values
+
+        return torch.cat(generated, dim=1), pkv
+
+    # Normal sampling + discriminator guide chunk selections
+    @torch.no_grad()
+    def _dis_sampling(
+        self,
+        prompt_tensor: torch.Tensor,
+        *,
+        max_length: int,
+        eos_token_id: int,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        warmup_len: int = 20,
+        segment_len: int = 50,
+        n_beams: int = 3,
+        max_lm_steps: int = 400,   # safety cap per chunk
+    ):
+        device = prompt_tensor.device
+        output = prompt_tensor
+
+        # -------- warmup (LM tokens, no discriminator) --------
+        warmup, _ = self._generate_chunk(
+            output,
+            max_new_tokens=warmup_len,
+            eos_token_id=eos_token_id,
+            temperature=temperature,
+            top_k=top_k,
+            past_key_values=None,
+        )
+
+        if warmup is None:
+            return output
+
+        output = torch.cat([output, warmup], dim=1)
+        if warmup[0, -1].item() == eos_token_id:
+            return output
+
+        # -------- discriminator-guided chunks --------
+        while output.shape[1] < max_length:
+
+            beam_lm_chunks = []
+            beam_speech_ids = []
+            eos_lm_chunks = []   # store EOS-ending beams
+
+            for _ in range(n_beams):
+                input_ids = output
+                past_key_values = None
+
+                lm_ids = []
+                speech_ids = []
+
+                for _ in range(max_lm_steps):
+                    outputs = self.backbone(
+                        input_ids=input_ids if past_key_values is None else input_ids[:, -1:],
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                    )
+                    logits = outputs.logits[:, -1, :] / temperature
+                    past_key_values = outputs.past_key_values
+
+                    if top_k > 0:
+                        v, idx = torch.topk(logits, top_k)
+                        probs = torch.softmax(v, dim=-1)
+                        next_id = idx[0, torch.multinomial(probs[0], 1)].item()
+                    else:
+                        probs = torch.softmax(logits, dim=-1)
+                        next_id = torch.multinomial(probs, 1).item()
+
+                    lm_ids.append(next_id)
+                    input_ids = torch.tensor([[next_id]], device=device)
+
+                    # ---- EOS handling ----
+                    if next_id == eos_token_id:
+                        eos_lm_chunks.append(lm_ids)
+                        break
+
+                    # ---- collect speech tokens only ----
+                    if self.speech_start_id <= next_id < self.speech_end_id:
+                        speech_ids.append(next_id - self.speech_start_id)
+                        if len(speech_ids) == segment_len:
+                            break
+
+                if len(speech_ids) == segment_len:
+                    beam_lm_chunks.append(lm_ids)
+                    beam_speech_ids.append(speech_ids)
+
+            if not beam_lm_chunks:
+                return output
+
+            # ---- discriminator selection ----
+            speech_tensor = torch.tensor(beam_speech_ids, device=device)  # [B, 50]
+            scores = self.discriminator(speech_tensor)
+            best = scores.argmax().item()
+
+            chosen_lm_ids = beam_lm_chunks[best]
+            chosen_lm_tensor = torch.tensor([chosen_lm_ids], device=device)
+
+            # ---- append chosen LM tokens ----
+            output = torch.cat([output, chosen_lm_tensor], dim=1)
+
+            # length guard
+            if output.shape[1] >= max_length:
+                return output[:, :max_length]
+            
+        # If any beam ended with EOS, accept and stop
+        if eos_lm_chunks:
+            chosen = eos_lm_chunks[0]   # or random / shortest / highest prob later
+            return torch.cat([output, torch.tensor([chosen], device=device)], dim=1)
+
+        # Otherwise, must have full speech chunks
+        if not beam_lm_chunks:
+            return output
+        
+
+    # RAS sampling + discriminator guide chunk selections
+    @torch.no_grad()
+    def _ras_dis_sampling(
+        self,
+        prompt_tensor: torch.Tensor,
+        *,
+        max_length: int,
+        eos_token_id: int,
+        temperature: float = 1.0,
+        warmup_len: int = 20,
+        segment_len: int = 50,
+        n_beams: int = 3,
+        max_lm_steps: int = 400,   # safety cap per chunk
+        # RAS params
+        top_p: float = 0.8,
+        top_k: int = 50,
+        win_size: int = 25,
+        tau_r: float = 0.1,
+    ):
+        device = prompt_tensor.device
+        output = prompt_tensor
+
+        # -------- warmup (plain top-k sample, no discriminator, no RAS) --------
+        warmup, _ = self._generate_chunk(
+            output,
+            max_new_tokens=warmup_len,
+            eos_token_id=eos_token_id,
+            temperature=temperature,
+            top_k=top_k,
+            past_key_values=None,
+        )
+        if warmup is None:
+            return output
+
+        output = torch.cat([output, warmup], dim=1)
+        if warmup[0, -1].item() == eos_token_id:
+            return output
+
+        # -------- discriminator-guided chunks with RAS sampling --------
+        while output.shape[1] < max_length:
+
+            beam_lm_chunks: list[list[int]] = []
+            beam_speech_ids: list[list[int]] = []
+            eos_lm_chunks: list[list[int]] = []
+
+            for _ in range(n_beams):
+                input_ids = output
+                past_key_values = None
+
+                lm_ids: list[int] = []
+                speech_ids: list[int] = []              # collected speech ids (0..65535) for discriminator
+                decoded_speech_hist: list[int] = []     # repetition window history in speech-id space
+
+                for _ in range(max_lm_steps):
+                    outputs = self.backbone(
+                        input_ids=input_ids if past_key_values is None else input_ids[:, -1:],
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                    )
+                    logits = outputs.logits[:, -1, :]   # (1, vocab)
+                    past_key_values = outputs.past_key_values
+
+                    scores = (logits.squeeze(0) / temperature)
+
+                    # ---- restrict to speech range + EOS ----
+                    scores = self._mask_to_speech_only(scores, eos_token_id=eos_token_id)
+
+                    # ---- RAS expects "decoded_tokens" in same id-space as scores (LM ids).
+                    # We maintain repetition history in speech-id space (0..65535),
+                    # then map to LM ids by adding speech_start_id.
+                    decoded_lm_hist = [sid + self.speech_start_id for sid in decoded_speech_hist]
+
+                    next_id = ras_sampling(
+                        scores,
+                        decoded_lm_hist,
+                        top_p=top_p,
+                        top_k=top_k,
+                        win_size=win_size,
+                        tau_r=tau_r,
+                    )
+
+                    lm_ids.append(next_id)
+                    input_ids = torch.tensor([[next_id]], device=device)
+
+                    # ---- EOS handling ----
+                    if next_id == eos_token_id:
+                        eos_lm_chunks.append(lm_ids)
+                        break
+
+                    # ---- collect speech tokens only ----
+                    sid = self._lm_to_speech_id_or_none(next_id)
+                    if sid is not None:
+                        speech_ids.append(sid)
+                        decoded_speech_hist.append(sid)
+
+                        if len(speech_ids) == segment_len:
+                            break
+
+                # only keep full speech chunks for discriminator scoring
+                if len(speech_ids) == segment_len:
+                    beam_lm_chunks.append(lm_ids)
+                    beam_speech_ids.append(speech_ids)
+
+            # If any beam ended with EOS, accept and stop (your intended semantics)
+            if eos_lm_chunks:
+                chosen = eos_lm_chunks[0]  # could choose shortest / highest score later
+                return torch.cat([output, torch.tensor([chosen], device=device)], dim=1)
+
+            if not beam_lm_chunks:
+                return output
+
+            # ---- discriminator selection ----
+            speech_tensor = torch.tensor(beam_speech_ids, device=device)  # [B, 50] in [0..65535]
+            scores = self.discriminator(speech_tensor)
+            best = scores.argmax().item()
+
+            chosen_lm_ids = beam_lm_chunks[best]
+            chosen_lm_tensor = torch.tensor([chosen_lm_ids], device=device)
+
+            # ---- append chosen LM tokens ----
+            output = torch.cat([output, chosen_lm_tensor], dim=1)
+
+            if output.shape[1] >= max_length:
+                return output[:, :max_length]
+
+        return output
 
     def _infer_torch(self, prompt_ids: list[int], sampling_scheme: str = "orig") -> str:
         prompt_tensor = torch.tensor(prompt_ids).unsqueeze(0).to(self.backbone.device)
@@ -593,6 +933,31 @@ class NeuTTS:
                     eos_token_id=speech_end_id,
                     temperature=1.0,
                     min_new_tokens=50,
+                    top_p=0.8,
+                    top_k=50,
+                    win_size=25,
+                    tau_r=0.1,
+                )
+            elif sampling_scheme == "dis":
+                output_tokens = self._dis_sampling(
+                    prompt_tensor,
+                    max_length=self.max_context,
+                    eos_token_id=speech_end_id,
+                    temperature=1.0,
+                    top_k=50,
+                    warmup_len=20,
+                    segment_len=50,
+                    n_beams=3,
+                )
+            elif sampling_scheme == "ras_dis":
+                output_tokens = self._ras_dis_sampling(
+                    prompt_tensor,
+                    max_length=self.max_context,
+                    eos_token_id=speech_end_id,
+                    temperature=1.0,
+                    warmup_len=20,
+                    segment_len=50,
+                    n_beams=3,
                     top_p=0.8,
                     top_k=50,
                     win_size=25,

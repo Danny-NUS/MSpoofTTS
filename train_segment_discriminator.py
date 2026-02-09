@@ -11,6 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.callbacks import ModelCheckpoint
 
 from torchmetrics.classification import BinaryAccuracy, BinaryAUROC
 from sklearn.metrics import classification_report
@@ -23,8 +24,10 @@ from Discriminator import SegmentTokenDiscriminator  # <- make sure this exists
 # PATH CONFIG
 # ============================================================
 
-REAL_ROOT = "/data2/minh_duc/from_hf/libritts/train.clean.100"
-SYN_ROOT  = "/data2/minh_duc/neutts/libritts/train.clean.100"
+REAL_TRAIN_ROOT = "/data2/minh_duc/from_hf/libritts/train.clean.100"
+SYN_TRAIN_ROOT  = "/data2/minh_duc/neutts/libritts/train.clean.100"
+REAL_TEST_ROOT = "/data2/minh_duc/from_hf/libritts/test.clean"
+SYN_TEST_ROOT  = "/data2/minh_duc/neutts/libritts/test.clean"
 SAVE_ROOT = "/data2/minh_duc/TTS_spoofing"
 
 os.makedirs(SAVE_ROOT, exist_ok=True)
@@ -33,7 +36,7 @@ os.makedirs(SAVE_ROOT, exist_ok=True)
 # SEGMENT CONFIG
 # ============================================================
 
-SEGMENT_LEN = 10
+SEGMENT_LEN = 50
 
 # ============================================================
 # TOKEN PARSER
@@ -238,6 +241,12 @@ class LitSegmentTokenDiscriminator(pl.LightningModule):
             lr=self.hparams.lr,
             weight_decay=self.hparams.weight_decay,
         )
+    
+    def on_save_checkpoint(self, checkpoint):
+        checkpoint["model_state_dict"] = self.model.state_dict()
+
+        # Optional: remove lightning junk if you want a clean file
+        checkpoint.pop("state_dict", None)
 
 # ============================================================
 # DATA MODULE
@@ -246,26 +255,30 @@ class LitSegmentTokenDiscriminator(pl.LightningModule):
 class TokenSpoofDataModule(pl.LightningDataModule):
     def __init__(
         self,
-        real_root: str,
-        syn_root: str,
+        real_train_root: str,
+        syn_train_root: str,
+        real_test_root: str,
+        syn_test_root: str,
         batch_size: int = 16,
         num_workers: int = 4,
         segment_len: int = SEGMENT_LEN,
     ):
         super().__init__()
-        self.real_root = real_root
-        self.syn_root = syn_root
+        self.real_train_root = real_train_root
+        self.syn_train_root = syn_train_root
+        self.real_test_root = real_test_root
+        self.syn_test_root = syn_test_root
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.segment_len = segment_len
 
     def setup(self, stage: Optional[str] = None):
         # Same slicing as your original script (adjust as you like)
-        real_train = load_kaldi_dataset(self.real_root, 0, 20000, min_len=self.segment_len)
-        real_test  = load_kaldi_dataset(self.real_root, 30000, 33000, min_len=self.segment_len)
+        real_train = load_kaldi_dataset(self.real_train_root, 0, 30000, min_len=self.segment_len)
+        real_test  = load_kaldi_dataset(self.real_test_root, 0, 4500, min_len=self.segment_len)
 
-        syn_train  = load_kaldi_dataset(self.syn_root, 0, 60000, min_len=self.segment_len)
-        syn_test   = load_kaldi_dataset(self.syn_root, 90000, 99000, min_len=self.segment_len)
+        syn_train  = load_kaldi_dataset(self.syn_train_root, 0, 90000, min_len=self.segment_len)
+        syn_test   = load_kaldi_dataset(self.syn_test_root, 0, 13500, min_len=self.segment_len)
 
         real_train_ds = SegmentTokenSpoofDataset(real_train, label=1, segment_len=self.segment_len)
         syn_train_ds  = SegmentTokenSpoofDataset(syn_train,  label=0, segment_len=self.segment_len)
@@ -317,21 +330,39 @@ class TokenSpoofDataModule(pl.LightningDataModule):
 # ============================================================
 
 def main():
-    model = SegmentTokenDiscriminator(segment_len=SEGMENT_LEN)
+    model = SegmentTokenDiscriminator(
+        segment_len=SEGMENT_LEN,
+        vocab_size=65536,
+        d_model=256,
+        nhead=8,
+        num_layers=4,
+        dim_feedforward=1024,
+        dropout=0.1,
+        )
 
     lit_model = LitSegmentTokenDiscriminator(model)
 
     dm = TokenSpoofDataModule(
-        real_root=REAL_ROOT,
-        syn_root=SYN_ROOT,
+        real_train_root=REAL_TRAIN_ROOT,
+        real_test_root=REAL_TEST_ROOT,
+        syn_train_root=SYN_TRAIN_ROOT,
+        syn_test_root=SYN_TEST_ROOT,
         batch_size=20,
         segment_len=SEGMENT_LEN,
-        num_workers=4,
-    )
+        num_workers=4
+        )
 
     logger = TensorBoardLogger(
         save_dir=SAVE_ROOT,
-        name="Segment_discriminator_len10",
+        name="Segment_discriminator_len" + str(SEGMENT_LEN),
+    )
+
+    checkpoint_cb = ModelCheckpoint(
+        dirpath=logger.log_dir,
+        filename="epoch{epoch}",
+        save_top_k=-1,          # <-- save ALL epochs
+        every_n_epochs=1,       # <-- every epoch
+        save_last=True,
     )
 
     trainer = pl.Trainer(
@@ -340,6 +371,7 @@ def main():
         max_epochs=5,
         logger=logger,
         log_every_n_steps=10,
+        callbacks=[checkpoint_cb],
     )
 
     print("-----------TRAINING--------------")

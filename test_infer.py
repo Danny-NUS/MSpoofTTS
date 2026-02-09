@@ -43,7 +43,7 @@ ASR_TAG  = "whisper-large-v3"
 
 N_SYN_PER_UTT = 1
 SEED = 42
-MAX_UTTS: Optional[int] = 100   # set e.g. 100 for debugging
+MAX_UTTS: Optional[int] = 1000   # set e.g. 100 for debugging
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -145,7 +145,7 @@ class WhisperASR:
 # BUILD + EVAL
 # =========================
 
-sampling_schemes = ["orig", "recon", "ras_k50_win25"]
+sampling_schemes = ["orig", "recon", "ras_k50_win25", "dis", "ras_dis"]
 
 def build_and_eval(examples):
     asr_dir = ensure_dirs()
