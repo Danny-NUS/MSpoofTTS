@@ -16,7 +16,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from torchmetrics.classification import BinaryAccuracy, BinaryAUROC
 from sklearn.metrics import classification_report
 
-from Discriminator import SegmentTokenDiscriminator  
+from Discriminator import StridedSegmentTokenDiscriminator
 
 # ============================================================
 # PATH CONFIG
@@ -34,7 +34,8 @@ os.makedirs(SAVE_ROOT, exist_ok=True)
 # SEGMENT CONFIG
 # ============================================================
 
-SEGMENT_LEN = 10
+SEGMENT_LEN = 50     
+SCALE = 10           
 
 # ============================================================
 # TOKEN PARSER
@@ -328,8 +329,9 @@ class TokenSpoofDataModule(pl.LightningDataModule):
 # ============================================================
 
 def main():
-    model = SegmentTokenDiscriminator(
-        segment_len=SEGMENT_LEN,
+    model = StridedSegmentTokenDiscriminator(
+        segment_len=SEGMENT_LEN,   # 50
+        scale=SCALE,               # 50 / 25 / 10
         vocab_size=65536,
         d_model=256,
         nhead=8,
@@ -352,7 +354,7 @@ def main():
 
     logger = TensorBoardLogger(
         save_dir=SAVE_ROOT,
-        name="Segment_discriminator_len" + str(SEGMENT_LEN),
+        name=f"Strided_discriminator_seg{SEGMENT_LEN}_scale{SCALE}",
     )
 
     checkpoint_cb = ModelCheckpoint(
