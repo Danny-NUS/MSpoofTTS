@@ -36,14 +36,14 @@ from neutts import NeuTTS
 # CONFIG
 # =========================
 
-SYN_ROOT = Path("/data2/minh_duc/neutts/libritts/infer.org.test.clean")
+SYN_ROOT = Path("/data2/minh_duc/neutts/libritts/eas.infer.org.test.clean")
 
-ASR_ROOT = Path("/data2/minh_duc/neutts/libritts/asr.infer.test")
+ASR_ROOT = Path("/data2/minh_duc/neutts/libritts/eas.asr.infer.test")
 ASR_TAG  = "whisper-large-v3"
 
 N_SYN_PER_UTT = 1
 SEED = 42
-MAX_UTTS: Optional[int] = 1000   # set e.g. 100 for debugging
+MAX_UTTS: Optional[int] = 40   # set e.g. 100 for debugging
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -145,7 +145,7 @@ class WhisperASR:
 # BUILD + EVAL
 # =========================
 
-sampling_schemes = ["orig", "recon", "ras_k50_win25", "dis", "ras_dis"]
+sampling_schemes = ["orig", "ras_k50_win25",  "ras_dis", "eas"] # "dis", "recon"
 
 def build_and_eval(examples):
     asr_dir = ensure_dirs()

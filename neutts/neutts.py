@@ -153,6 +153,70 @@ def ras_sampling(
     return top_id
 
 
+class EASPenalty:
+    """
+    Multi-instance temporal penalty memory.
+
+    - Each time a token appears in EAS top-k, a new instance is added.
+    - Each instance decays exponentially.
+    - Instances expire after `window` steps.
+    - Total penalty per token is capped at `cap`.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        alpha: float = 0.2,
+        beta: float = 0.7,
+        window: int = 15,
+        cap: float = 0.8,
+        device: torch.device | None = None,
+    ):
+        self.alpha = alpha
+        self.beta = beta
+        self.window = window
+        self.cap = cap
+        self.device = device
+
+        self.instances = []  # list of dicts: {id, rank, age}
+        self.vocab_size = vocab_size
+
+    def step(self):
+        # Increase age
+        for inst in self.instances:
+            inst["age"] += 1
+
+        # Remove expired
+        self.instances = [
+            inst for inst in self.instances
+            if inst["age"] <= self.window
+        ]
+
+    def update_cluster(self, token_ids: torch.Tensor):
+        """
+        token_ids: tensor of top-k LM ids (ordered by rank)
+        """
+        for rank, tok in enumerate(token_ids.tolist()):
+            self.instances.append({
+                "id": tok,
+                "rank": rank,
+                "age": 0,
+            })
+
+    def build_penalty_vector(self) -> torch.Tensor:
+        penalty = torch.zeros(self.vocab_size, device=self.device)
+
+        for inst in self.instances:
+            rank_scale = 1.0 / (1.0 + inst["rank"])
+            value = self.alpha * rank_scale * (self.beta ** inst["age"])
+            penalty[inst["id"]] += value
+
+        # Hard cap per token
+        penalty.clamp_(max=self.cap)
+
+        return penalty
+
+
 class NeuTTS:
 
     def __init__(
@@ -616,6 +680,111 @@ class NeuTTS:
             return torch.cat([prompt_tensor, gen], dim=1)
         else:
             return prompt_tensor
+        
+    @torch.no_grad()
+    def _eas_generate(
+        self,
+        prompt_tensor: torch.Tensor,
+        *,
+        max_length: int,
+        eos_token_id: int,
+        temperature: float = 1.0,
+        use_cache: bool = True,
+        min_new_tokens: int = 0,
+        # EAS params
+        eas_top_k: int = 3,     # cluster size
+        alpha: float = 0.2,
+        beta: float = 0.7,
+        window: int = 15,
+        cap: float = 0.8,
+        top_p: float = 0.8,     # sampling nucleus
+        sample_top_k: int = 25,
+    ):
+        """
+        Entropy-Aware Sampling with multi-instance temporal penalty memory.
+        """
+
+        device = prompt_tensor.device
+        input_ids = prompt_tensor
+        past_key_values = None
+        generated = []
+
+        vocab_size = self.backbone.config.vocab_size
+
+        penalty_memory = EASPenalty(
+            vocab_size=vocab_size,
+            alpha=alpha,
+            beta=beta,
+            window=window,
+            cap=cap,
+            device=device,
+        )
+
+        cur_len = input_ids.shape[1]
+
+        for _ in range(max_length - cur_len):
+
+            # ---- forward ----
+            if past_key_values is None:
+                outputs = self.backbone(input_ids=input_ids, use_cache=use_cache)
+            else:
+                outputs = self.backbone(
+                    input_ids=input_ids[:, -1:],
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                )
+
+            logits = outputs.logits[:, -1, :]
+            past_key_values = outputs.past_key_values
+
+            scores = logits.squeeze(0)
+
+            if temperature != 1.0:
+                scores = scores / temperature
+
+            # ---- restrict to speech + EOS ----
+            scores = self._mask_to_speech_only(scores, eos_token_id=eos_token_id)
+
+            # ---- build penalty vector ----
+            penalty = penalty_memory.build_penalty_vector()
+
+            # ---- apply penalty ----
+            penalized_scores = scores - penalty
+
+            # ---- sampling (nucleus or hybrid) ----
+            next_id = nucleus_sampling(
+                penalized_scores,
+                top_p=top_p,
+                top_k=sample_top_k,
+            )
+
+            next_token = torch.tensor([[next_id]], device=device)
+            generated.append(next_token)
+
+            # stop
+            if next_id == eos_token_id and len(generated) >= min_new_tokens:
+                break
+
+            # =====================================================
+            # PENALTY UPDATE
+            # =====================================================
+
+            # 1) advance time
+            penalty_memory.step()
+
+            # 2) compute EAS cluster from penalized scores
+            values, indices = torch.topk(penalized_scores, eas_top_k)
+
+            # 3) update memory with new cluster
+            penalty_memory.update_cluster(indices)
+
+            input_ids = next_token
+
+        if generated:
+            gen = torch.cat(generated, dim=1)
+            return torch.cat([prompt_tensor, gen], dim=1)
+        else:
+            return prompt_tensor
 
     @torch.no_grad()
     def _generate_chunk(
@@ -686,7 +855,7 @@ class NeuTTS:
             eos_token_id=eos_token_id,
             temperature=temperature,
             top_k=top_k,
-            past_key_values=None,
+            past_key_values=None,    ###### PLEASE FIX THIS LATER #######
         )
 
         if warmup is None:
@@ -962,6 +1131,21 @@ class NeuTTS:
                     top_k=50,
                     win_size=25,
                     tau_r=0.1,
+                )
+            elif sampling_scheme == "eas":
+                output_tokens = self._eas_generate(
+                    prompt_tensor,
+                    max_length=self.max_context,
+                    eos_token_id=speech_end_id,
+                    temperature=1.0,
+                    min_new_tokens=50,
+                    eas_top_k=3,
+                    alpha=0.2,
+                    beta=0.7,
+                    window=15,
+                    cap=0.8,
+                    top_p=0.8,
+                    sample_top_k=50,
                 )
 
         input_length = prompt_tensor.shape[-1]
