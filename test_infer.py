@@ -43,7 +43,7 @@ ASR_TAG  = "whisper-large-v3"
 
 N_SYN_PER_UTT = 1
 SEED = 42
-MAX_UTTS: Optional[int] = 40   # set e.g. 100 for debugging
+MAX_UTTS: Optional[int] = 100   # set e.g. 100 for debugging
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
