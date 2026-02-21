@@ -72,26 +72,45 @@ def _linear_overlap_add(frames: list[np.ndarray], stride: int) -> np.ndarray:
     return out / sum_weight
 
 
-def _sample_top_k(
-        logits: torch.Tensor,
-        top_k: int,
-        temperature: float,
-    ) -> torch.Tensor:
-        """
-        logits: (vocab,)
-        returns: sampled token id (scalar tensor)
-        """
-        if temperature != 1.0:
-            logits = logits / temperature
+# def _sample_top_k(
+#         logits: torch.Tensor,
+#         top_k: int,
+#         temperature: float,
+#     ) -> torch.Tensor:
+#         """
+#         logits: (vocab,)
+#         returns: sampled token id (scalar tensor)
+#         """
+#         if temperature != 1.0:
+#             logits = logits / temperature
 
-        if top_k is not None and top_k > 0:
-            values, indices = torch.topk(logits, top_k)
-            probs = torch.softmax(values, dim=-1)
-            sampled = torch.multinomial(probs, num_samples=1)
-            return indices[sampled]
-        else:
-            probs = torch.softmax(logits, dim=-1)
-            return torch.multinomial(probs, num_samples=1)
+#         if top_k is not None and top_k > 0:
+#             values, indices = torch.topk(logits, top_k)
+#             probs = torch.softmax(values, dim=-1)
+#             sampled = torch.multinomial(probs, num_samples=1)
+#             return indices[sampled]
+#         else:
+#             probs = torch.softmax(logits, dim=-1)
+#             return torch.multinomial(probs, num_samples=1)
+        
+
+def _sample_top_k(
+    logits: torch.Tensor,   # (B, vocab)
+    top_k: int,
+    temperature: float,
+) -> torch.Tensor:          # (B, 1)
+
+    if temperature != 1.0:
+        logits = logits / temperature
+
+    if top_k is not None and top_k > 0:
+        values, indices = torch.topk(logits, top_k, dim=-1)
+        probs = torch.softmax(values, dim=-1)
+        sampled = torch.multinomial(probs, num_samples=1)
+        return indices.gather(-1, sampled)
+    else:
+        probs = torch.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
 
 
 def nucleus_sampling(
@@ -546,13 +565,18 @@ class NeuTTS:
             past_key_values = outputs.past_key_values
 
             if do_sample:
+                logits = self._mask_to_speech_only(
+                    logits.squeeze(0),   # mask function expects (vocab,)
+                    eos_token_id,
+                ).unsqueeze(0)          # restore batch dim
+
                 next_token = _sample_top_k(
-                    logits.squeeze(0),
+                    logits,
                     top_k=top_k,
                     temperature=temperature,
                 )
             else:
-                next_token = torch.argmax(logits, dim=-1)
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
 
             next_token = next_token.view(1, 1)
             generated.append(next_token)
@@ -855,9 +879,8 @@ class NeuTTS:
             eos_token_id=eos_token_id,
             temperature=temperature,
             top_k=top_k,
-            past_key_values=None,    ###### PLEASE FIX THIS LATER #######
+            past_key_values=None,  # TODO: later, thread pkv
         )
-
         if warmup is None:
             return output
 
@@ -868,9 +891,12 @@ class NeuTTS:
         # -------- discriminator-guided chunks --------
         while output.shape[1] < max_length:
 
-            beam_lm_chunks = []
-            beam_speech_ids = []
-            eos_lm_chunks = []   # store EOS-ending beams
+            # Each candidate stores:
+            # - lm_ids: list[int] tokens to append
+            # - speech_ids: list[int] collected speech token ids (shifted)
+            # - ended_with_eos: bool
+            # - ended_by_cap: bool (hit max_lm_steps without eos and without reaching segment_len)
+            candidates = []
 
             for _ in range(n_beams):
                 input_ids = output
@@ -878,14 +904,16 @@ class NeuTTS:
 
                 lm_ids = []
                 speech_ids = []
+                ended_with_eos = False
+                ended_by_cap = False
 
-                for _ in range(max_lm_steps):
+                for step in range(max_lm_steps):
                     outputs = self.backbone(
                         input_ids=input_ids if past_key_values is None else input_ids[:, -1:],
                         past_key_values=past_key_values,
                         use_cache=True,
                     )
-                    logits = outputs.logits[:, -1, :] / temperature
+                    logits = outputs.logits[:, -1, :] / max(temperature, 1e-8)
                     past_key_values = outputs.past_key_values
 
                     if top_k > 0:
@@ -901,7 +929,7 @@ class NeuTTS:
 
                     # ---- EOS handling ----
                     if next_id == eos_token_id:
-                        eos_lm_chunks.append(lm_ids)
+                        ended_with_eos = True
                         break
 
                     # ---- collect speech tokens only ----
@@ -910,37 +938,85 @@ class NeuTTS:
                         if len(speech_ids) == segment_len:
                             break
 
-                if len(speech_ids) == segment_len:
-                    beam_lm_chunks.append(lm_ids)
-                    beam_speech_ids.append(speech_ids)
+                # If we exited because we exhausted max_lm_steps without eos and without full segment
+                if (not ended_with_eos) and (len(speech_ids) < segment_len) and (len(lm_ids) >= max_lm_steps):
+                    ended_by_cap = True
 
-            if not beam_lm_chunks:
-                return output
+                candidates.append(
+                    {
+                        "lm_ids": lm_ids,
+                        "speech_ids": speech_ids,
+                        "ended_with_eos": ended_with_eos,
+                        "ended_by_cap": ended_by_cap,
+                    }
+                )
 
-            # ---- discriminator selection ----
+            # Partition candidates
+            full = [c for c in candidates if len(c["speech_ids"]) == segment_len]
+            partial = [c for c in candidates if len(c["speech_ids"]) < segment_len]  # includes eos + cap
+
+            # ----------------------------
+            # Your heuristic:
+            # 1) if all < 50 -> choose longer one (by speech_len, tie-break lm_len)
+            # 2) if only 1 == 50 -> continue with that one
+            # 3) if >=2 == 50 -> discriminator compare
+            # ----------------------------
+
+            # Case 1: all less than segment_len (no full chunk)
+            if len(full) == 0:
+                if len(partial) == 0:
+                    return output  # nothing generated at all (shouldn't happen)
+
+                # choose longer partial: max speech_len, tie-break by lm_len
+                best_partial = max(
+                    partial,
+                    key=lambda c: (len(c["speech_ids"]), len(c["lm_ids"]))
+                )
+
+                chosen_lm_ids = best_partial["lm_ids"]
+                if not chosen_lm_ids:
+                    return output
+
+                chosen_lm_tensor = torch.tensor([chosen_lm_ids], device=device)
+                output = torch.cat([output, chosen_lm_tensor], dim=1)
+
+                # If EOS happened, we're done.
+                # If ended_by_cap (no eos, no full segment), we also stop to avoid looping forever.
+                if best_partial["ended_with_eos"] or best_partial["ended_by_cap"]:
+                    return output[:, :max_length] if output.shape[1] > max_length else output
+
+                # Otherwise (rare), keep going, but still guard max_length
+                if output.shape[1] >= max_length:
+                    return output[:, :max_length]
+                continue
+
+            # Case 2: exactly one full chunk -> continue with it (no discriminator)
+            if len(full) == 1:
+                chosen_lm_ids = full[0]["lm_ids"]
+                if not chosen_lm_ids:
+                    return output
+
+                output = torch.cat([output, torch.tensor([chosen_lm_ids], device=device)], dim=1)
+                if output.shape[1] >= max_length:
+                    return output[:, :max_length]
+                continue
+
+            # Case 3: >=2 full chunks -> discriminator selection among full ones
+            beam_speech_ids = [c["speech_ids"] for c in full]
             speech_tensor = torch.tensor(beam_speech_ids, device=device)  # [B, 50]
             scores = self.discriminator(speech_tensor)
             best = scores.argmax().item()
 
-            chosen_lm_ids = beam_lm_chunks[best]
-            chosen_lm_tensor = torch.tensor([chosen_lm_ids], device=device)
+            chosen_lm_ids = full[best]["lm_ids"]
+            if not chosen_lm_ids:
+                return output
 
-            # ---- append chosen LM tokens ----
-            output = torch.cat([output, chosen_lm_tensor], dim=1)
+            output = torch.cat([output, torch.tensor([chosen_lm_ids], device=device)], dim=1)
 
-            # length guard
             if output.shape[1] >= max_length:
                 return output[:, :max_length]
-            
-        # If any beam ended with EOS, accept and stop
-        if eos_lm_chunks:
-            chosen = eos_lm_chunks[0]   # or random / shortest / highest prob later
-            return torch.cat([output, torch.tensor([chosen], device=device)], dim=1)
 
-        # Otherwise, must have full speech chunks
-        if not beam_lm_chunks:
-            return output
-        
+        return output[:, :max_length]
 
     # RAS sampling + discriminator guide chunk selections
     @torch.no_grad()

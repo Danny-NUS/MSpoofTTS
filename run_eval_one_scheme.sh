@@ -7,11 +7,12 @@
 #   - orig
 #   - recon
 #   - ras_k50_win25
+#   - dis
 #   - ras_dis
 #   - eas
 # ========================================
 
-SCHEME="ASR_GT"
+SCHEME="dis"
 MAX_UTTS=100
 N_SYN=1
 SEED=42

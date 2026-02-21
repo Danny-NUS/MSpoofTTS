@@ -38,8 +38,8 @@ from neutts import NeuTTS
 # CONFIG 
 # =========================
 
-SYN_ROOT = Path("/data2/minh_duc/neutts/libritts/infer/syn.test.clean")
-ASR_ROOT = Path("/data2/minh_duc/neutts/libritts/infer/asr.test.clean")
+SYN_ROOT = Path("/data2/minh_duc/neutts/libritts/infer100/syn.test.clean")
+ASR_ROOT = Path("/data2/minh_duc/neutts/libritts/infer100/asr.test.clean")
 ASR_TAG = "whisper-large-v3"
 
 # default knobs (override via CLI)
@@ -50,7 +50,7 @@ DEFAULT_MAX_UTTS: Optional[int] = 100  # set None for full
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Schemes allowed for TTS synthesis
-sampling_schemes = ["orig", "ras_k50_win25", "ras_dis", "eas"]  # add more here
+sampling_schemes = ["orig", "ras_k50_win25", "dis", "ras_dis", "eas", "recon"]  # add more here
 
 # =========================
 # Optional NISQA
