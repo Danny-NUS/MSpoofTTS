@@ -648,40 +648,28 @@ class NeuTTS:
         self,
         prompt_tensor: torch.Tensor,
         *,
-        max_length: int | None = None,         # backward compatible
-        max_new_tokens: int | None = None,     
+        max_length: int | None = None,
+        max_new_tokens: int | None = None,
         eos_token_id: int,
         temperature: float = 1.0,
         use_cache: bool = True,
         min_new_tokens: int = 0,
-        past_key_values=None,                 
-        return_pkv: bool = False,            
+        past_key_values=None,
+        return_pkv: bool = False,
         # RAS params
         top_p: float = 0.8,
         top_k: int = 50,
         win_size: int = 20,
         tau_r: float = 0.1,
-        # Optional: carry repetition history across calls (recommended for chunking)
-        decoded_speech_ids: list[int] | None = None,  
     ):
-        """
-        Explicit autoregressive generation with Repetition Aware Sampling (RAS),
-        restricted to speech tokens + eos_token_id.
-
-        If return_pkv=True, returns (output_tokens, pkv, decoded_speech_ids).
-        Else returns output_tokens.
-        """
         device = prompt_tensor.device
         input_ids = prompt_tensor
         pkv = past_key_values
 
         generated = []
+        decoded_speech_ids = []  # LOCAL ONLY
 
-        # repetition history (speech-id space 0..(speech_vocab-1))
-        if decoded_speech_ids is None:
-            decoded_speech_ids = []
-
-        # Determine steps
+        # determine number of steps
         if max_new_tokens is not None:
             steps = max_new_tokens
         else:
@@ -691,6 +679,7 @@ class NeuTTS:
             steps = max(0, max_length - cur_len)
 
         for _ in range(steps):
+
             if pkv is None:
                 outputs = self.backbone(input_ids=input_ids, use_cache=use_cache)
             else:
@@ -700,7 +689,7 @@ class NeuTTS:
                     use_cache=use_cache,
                 )
 
-            logits = outputs.logits[:, -1, :]  # (1, vocab)
+            logits = outputs.logits[:, -1, :]
             pkv = outputs.past_key_values
 
             scores = logits.squeeze(0)
@@ -708,12 +697,8 @@ class NeuTTS:
             if temperature != 1.0:
                 scores = scores / max(temperature, 1e-8)
 
-            # ---- restrict to speech range + EOS ----
             scores = self._mask_to_speech_only(scores, eos_token_id=eos_token_id)
 
-            # ---- RAS on masked scores ----
-            # ras_sampling expects IDs in the same space as `scores` (LM vocab IDs),
-            # so convert speech-id history back to LM IDs.
             lm_hist = [sid + self.speech_start_id for sid in decoded_speech_ids]
 
             next_id = ras_sampling(
@@ -728,14 +713,11 @@ class NeuTTS:
             next_token = torch.tensor([[next_id]], device=device)
             generated.append(next_token)
 
-            # update speech repetition history (speech tokens only)
             sid = self._lm_to_speech_id_or_none(next_id)
             if sid is not None:
                 decoded_speech_ids.append(sid)
 
-            # stop on EOS once min_new_tokens satisfied
             if next_id == eos_token_id and len(generated) >= min_new_tokens:
-                input_ids = next_token  # keep stream consistent
                 break
 
             input_ids = next_token
@@ -747,8 +729,7 @@ class NeuTTS:
             out = prompt_tensor
 
         if return_pkv:
-            # Return decoded_speech_ids too so chunk-to-chunk RAS is consistent
-            return out, pkv, decoded_speech_ids
+            return out, pkv
         return out
         
     @torch.no_grad()
@@ -756,7 +737,8 @@ class NeuTTS:
         self,
         prompt_tensor: torch.Tensor,
         *,
-        max_length: int,
+        max_length: int | None = None,
+        max_new_tokens: int | None = None,
         eos_token_id: int,
         temperature: float = 1.0,
         use_cache: bool = True,
@@ -792,7 +774,17 @@ class NeuTTS:
 
         cur_len = input_ids.shape[1]
 
-        for _ in range(max_length - cur_len):
+        # determine number of steps
+        steps = 0
+        if max_new_tokens is not None:
+            steps = max_new_tokens
+        else:
+            if max_length is None:
+                raise ValueError("Either max_new_tokens or max_length must be provided.")
+            cur_len = input_ids.shape[1]
+            steps = max(0, max_length - cur_len)
+
+        for _ in range(steps):
 
             # ---- forward ----
             if past_key_values is None:
@@ -1086,8 +1078,23 @@ class NeuTTS:
         device = prompt_tensor.device
         output = prompt_tensor
 
-        # -------- warmup (RAS tokens, no discriminator) --------
-        # NOTE: no PKV threading here; we keep the known-correct behavior
+        # -------- warmup (plain top-k, same as your original ras_dis) --------
+        # warmup, _ = self._generate_chunk(
+        #     output,
+        #     max_new_tokens=warmup_len,
+        #     eos_token_id=eos_token_id,
+        #     temperature=temperature,
+        #     top_k=top_k,
+        #     past_key_values=None,
+        # )
+        # if warmup is None:
+        #     return output
+
+        # output = torch.cat([output, warmup], dim=1)
+        # if output[0, -1].item() == eos_token_id:
+        #     return output[:, :max_length]
+
+        # -------- warmup (RAS, no discriminator) --------
         warmup_out = self._ras_generate(
             output,
             max_new_tokens=warmup_len,
@@ -1095,35 +1102,21 @@ class NeuTTS:
             temperature=temperature,
             use_cache=True,
             min_new_tokens=warmup_len,  # force exact warmup_len
-            past_key_values=None,
-            return_pkv=False,
             top_p=top_p,
             top_k=top_k,
             win_size=win_size,
             tau_r=tau_r,
-            decoded_speech_ids=None,
         )
 
-        # Extract warmup tokens (new tokens only)
         warmup = warmup_out[:, output.shape[1]:]
         if warmup.numel() == 0:
             return output
 
         output = torch.cat([output, warmup], dim=1)
-
-        # Build initial RAS repetition history from warmup (speech-id space)
-        base_hist: list[int] = []
-        for tid in warmup[0].tolist():
-            if tid == eos_token_id:
-                break
-            sid = self._lm_to_speech_id_or_none(tid)
-            if sid is not None:
-                base_hist.append(sid)
-
         if output[0, -1].item() == eos_token_id:
             return output[:, :max_length]
 
-        # -------- discriminator-guided chunks --------
+        # -------- discriminator-guided chunks with RAS sampling --------
         while output.shape[1] < max_length:
 
             candidates = []
@@ -1133,12 +1126,11 @@ class NeuTTS:
                 past_key_values = None
 
                 lm_ids: list[int] = []
-                speech_ids: list[int] = []
+                speech_ids: list[int] = []          # speech-id space [0..65535]
+                decoded_speech_hist: list[int] = [] # repetition history (speech-id space)
+
                 ended_with_eos = False
                 ended_by_cap = False
-
-                # Each beam starts from the same warmup-derived history
-                decoded_speech_ids = list(base_hist)
 
                 for step in range(max_lm_steps):
                     outputs = self.backbone(
@@ -1146,22 +1138,22 @@ class NeuTTS:
                         past_key_values=past_key_values,
                         use_cache=True,
                     )
-                    logits = outputs.logits[:, -1, :]  # (1, vocab)
+                    logits = outputs.logits[:, -1, :]   # (1, vocab)
                     past_key_values = outputs.past_key_values
 
                     scores = logits.squeeze(0)
-
                     if temperature != 1.0:
                         scores = scores / max(temperature, 1e-8)
 
-                    # ---- restrict to speech range + EOS ----
+                    # restrict to speech range + EOS
                     scores = self._mask_to_speech_only(scores, eos_token_id=eos_token_id)
 
-                    # ---- RAS choose next_id ----
-                    lm_hist = [sid + self.speech_start_id for sid in decoded_speech_ids]
+                    # RAS expects decoded tokens in LM-id space
+                    decoded_lm_hist = [sid + self.speech_start_id for sid in decoded_speech_hist]
+
                     next_id = ras_sampling(
                         scores,
-                        lm_hist,
+                        decoded_lm_hist,
                         top_p=top_p,
                         top_k=top_k,
                         win_size=win_size,
@@ -1171,24 +1163,19 @@ class NeuTTS:
                     lm_ids.append(next_id)
                     input_ids = torch.tensor([[next_id]], device=device)
 
-                    # ---- EOS handling ----
+                    # EOS handling
                     if next_id == eos_token_id:
                         ended_with_eos = True
                         break
 
-                    # ---- collect speech tokens only ----
+                    # collect speech tokens (should always be speech due to mask, but keep safe)
                     if self.speech_start_id <= next_id < self.speech_end_id:
                         sid = next_id - self.speech_start_id
                         speech_ids.append(sid)
-                        decoded_speech_ids.append(sid)
+                        decoded_speech_hist.append(sid)
+
                         if len(speech_ids) == segment_len:
                             break
-                    else:
-                        # Should not happen because of _mask_to_speech_only,
-                        # but keep safe behavior if masking ever changes.
-                        sid2 = self._lm_to_speech_id_or_none(next_id)
-                        if sid2 is not None:
-                            decoded_speech_ids.append(sid2)
 
                 if (not ended_with_eos) and (len(speech_ids) < segment_len) and (len(lm_ids) >= max_lm_steps):
                     ended_by_cap = True
@@ -1199,35 +1186,28 @@ class NeuTTS:
                         "speech_ids": speech_ids,
                         "ended_with_eos": ended_with_eos,
                         "ended_by_cap": ended_by_cap,
-                        # keep for updating base_hist when we accept a chunk
-                        "decoded_speech_ids_end": decoded_speech_ids,
                     }
                 )
 
+            # Partition candidates
             full = [c for c in candidates if len(c["speech_ids"]) == segment_len]
-            partial = [c for c in candidates if len(c["speech_ids"]) < segment_len]
+            partial = [c for c in candidates if len(c["speech_ids"]) < segment_len]  # includes EOS + cap
 
-            # ---- same heuristic as your correct dis_sampling ----
+            # ---- SAME heuristic as your fixed dis_sampling ----
 
-            # Case 1: all less than segment_len (no full chunk)
+            # Case 1: no full chunk -> choose best partial (longer speech_len, tie-break lm_len)
             if len(full) == 0:
                 if len(partial) == 0:
                     return output[:, :max_length]
 
-                best_partial = max(
-                    partial,
-                    key=lambda c: (len(c["speech_ids"]), len(c["lm_ids"]))
-                )
-
+                best_partial = max(partial, key=lambda c: (len(c["speech_ids"]), len(c["lm_ids"])))
                 chosen_lm_ids = best_partial["lm_ids"]
                 if not chosen_lm_ids:
                     return output[:, :max_length]
 
                 output = torch.cat([output, torch.tensor([chosen_lm_ids], device=device)], dim=1)
 
-                # update repetition history to the chosen beam's end state
-                base_hist = best_partial["decoded_speech_ids_end"]
-
+                # stop if EOS or cap (prevents looping)
                 if best_partial["ended_with_eos"] or best_partial["ended_by_cap"]:
                     return output[:, :max_length]
 
@@ -1242,28 +1222,216 @@ class NeuTTS:
                     return output[:, :max_length]
 
                 output = torch.cat([output, torch.tensor([chosen_lm_ids], device=device)], dim=1)
-
-                # update repetition history to the chosen beam's end state
-                base_hist = full[0]["decoded_speech_ids_end"]
-
                 if output.shape[1] >= max_length:
                     return output[:, :max_length]
                 continue
 
-            # Case 3: >=2 full chunks -> discriminator selection among full ones
+            # Case 3: >=2 full chunks -> discriminator among full ones
             beam_speech_ids = [c["speech_ids"] for c in full]
             speech_tensor = torch.tensor(beam_speech_ids, device=device)  # [B, 50]
-            scores = self.discriminator(speech_tensor)
-            best = scores.argmax().item()
+            disc_scores = self.discriminator(speech_tensor)
+            best = disc_scores.argmax().item()
 
             chosen_lm_ids = full[best]["lm_ids"]
             if not chosen_lm_ids:
                 return output[:, :max_length]
 
             output = torch.cat([output, torch.tensor([chosen_lm_ids], device=device)], dim=1)
+            if output.shape[1] >= max_length:
+                return output[:, :max_length]
 
-            # update repetition history to the chosen beam's end state
-            base_hist = full[best]["decoded_speech_ids_end"]
+        return output[:, :max_length]
+
+    @torch.no_grad()
+    def _eas_dis_generate(
+        self,
+        prompt_tensor: torch.Tensor,
+        *,
+        max_length: int,
+        eos_token_id: int,
+        temperature: float = 1.0,
+        warmup_len: int = 20,
+        segment_len: int = 50,
+        n_beams: int = 3,
+        max_lm_steps: int = 400,
+
+        # EAS params
+        eas_top_k: int = 3,
+        alpha: float = 0.2,
+        beta: float = 0.7,
+        window: int = 15,
+        cap: float = 0.8,
+        top_p: float = 0.8,
+        sample_top_k: int = 25,
+    ):
+        device = prompt_tensor.device
+        output = prompt_tensor
+
+        # -------- warmup (no discriminator, use EAS) --------
+        warmup = self._eas_generate(
+            output,
+            max_new_tokens=warmup_len,
+            eos_token_id=eos_token_id,
+            temperature=temperature,
+            eas_top_k=eas_top_k,
+            alpha=alpha,
+            beta=beta,
+            window=window,
+            cap=cap,
+            top_p=top_p,
+            sample_top_k=sample_top_k,
+        )
+
+        # warmup returns full tensor (prompt + new tokens)
+        output = warmup
+
+        if output[0, -1].item() == eos_token_id:
+            return output
+
+        # -------- discriminator-guided chunks --------
+        while output.shape[1] < max_length:
+
+            candidates = []
+
+            for _ in range(n_beams):
+
+                input_ids = output
+                past_key_values = None
+
+                lm_ids = []
+                speech_ids = []
+                ended_with_eos = False
+                ended_by_cap = False
+
+                vocab_size = self.backbone.config.vocab_size
+                penalty_memory = EASPenalty(
+                    vocab_size=vocab_size,
+                    alpha=alpha,
+                    beta=beta,
+                    window=window,
+                    cap=cap,
+                    device=device,
+                )
+
+                for step in range(max_lm_steps):
+
+                    # ---- forward ----
+                    outputs = self.backbone(
+                        input_ids=input_ids if past_key_values is None else input_ids[:, -1:],
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                    )
+
+                    logits = outputs.logits[:, -1, :]
+                    past_key_values = outputs.past_key_values
+
+                    scores = logits.squeeze(0)
+
+                    if temperature != 1.0:
+                        scores = scores / temperature
+
+                    # restrict
+                    scores = self._mask_to_speech_only(scores, eos_token_id)
+
+                    # build penalty
+                    penalty = penalty_memory.build_penalty_vector()
+                    penalized_scores = scores - penalty
+
+                    # sample
+                    next_id = nucleus_sampling(
+                        penalized_scores,
+                        top_p=top_p,
+                        top_k=sample_top_k,
+                    )
+
+                    lm_ids.append(next_id)
+                    input_ids = torch.tensor([[next_id]], device=device)
+
+                    # stop conditions
+                    if next_id == eos_token_id:
+                        ended_with_eos = True
+                        break
+
+                    # collect speech tokens
+                    if self.speech_start_id <= next_id < self.speech_end_id:
+                        speech_ids.append(next_id - self.speech_start_id)
+                        if len(speech_ids) == segment_len:
+                            break
+
+                    # =========================
+                    # EAS update
+                    # =========================
+
+                    penalty_memory.step()
+
+                    values, indices = torch.topk(penalized_scores, eas_top_k)
+                    penalty_memory.update_cluster(indices)
+
+                if (
+                    not ended_with_eos
+                    and len(speech_ids) < segment_len
+                    and len(lm_ids) >= max_lm_steps
+                ):
+                    ended_by_cap = True
+
+                candidates.append(
+                    {
+                        "lm_ids": lm_ids,
+                        "speech_ids": speech_ids,
+                        "ended_with_eos": ended_with_eos,
+                        "ended_by_cap": ended_by_cap,
+                    }
+                )
+
+            # -------- partition --------
+            full = [c for c in candidates if len(c["speech_ids"]) == segment_len]
+            partial = [c for c in candidates if len(c["speech_ids"]) < segment_len]
+
+            # Case 1: no full
+            if len(full) == 0:
+                if len(partial) == 0:
+                    return output
+
+                best_partial = max(
+                    partial,
+                    key=lambda c: (len(c["speech_ids"]), len(c["lm_ids"]))
+                )
+
+                chosen_lm_ids = best_partial["lm_ids"]
+                if not chosen_lm_ids:
+                    return output
+
+                output = torch.cat(
+                    [output, torch.tensor([chosen_lm_ids], device=device)],
+                    dim=1,
+                )
+
+                if best_partial["ended_with_eos"] or best_partial["ended_by_cap"]:
+                    return output[:, :max_length]
+
+                continue
+
+            # Case 2: exactly one full
+            if len(full) == 1:
+                output = torch.cat(
+                    [output, torch.tensor([full[0]["lm_ids"]], device=device)],
+                    dim=1,
+                )
+                if output.shape[1] >= max_length:
+                    return output[:, :max_length]
+                continue
+
+            # Case 3: >=2 full → discriminator
+            beam_speech_ids = [c["speech_ids"] for c in full]
+            speech_tensor = torch.tensor(beam_speech_ids, device=device)
+
+            scores = self.discriminator(speech_tensor)
+            best = scores.argmax().item()
+
+            output = torch.cat(
+                [output, torch.tensor([full[best]["lm_ids"]], device=device)],
+                dim=1,
+            )
 
             if output.shape[1] >= max_length:
                 return output[:, :max_length]
@@ -1345,6 +1513,26 @@ class NeuTTS:
                     beta=0.7,
                     window=15,
                     cap=0.8,
+                    top_p=0.8,
+                    sample_top_k=50,
+                )
+            elif sampling_scheme == "eas_dis":
+                output_tokens = self._eas_dis_generate(
+                    prompt_tensor,
+                    max_length=self.max_context,
+                    eos_token_id=speech_end_id,
+                    temperature=1.0,
+
+                    warmup_len=20,
+                    segment_len=50,
+                    n_beams=3,
+
+                    # EAS params
+                    eas_top_k=3,
+                    alpha=0.2,          # slightly smaller than eas-only
+                    beta=0.7,
+                    window=15,
+                    cap=0.8,             # slightly softer cap than standalone eas
                     top_p=0.8,
                     sample_top_k=50,
                 )
