@@ -13,6 +13,7 @@ from neucodec import NeuCodec, DistillNeuCodec
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from Discriminator import SegmentTokenDiscriminator
+from Discriminator import StridedSegmentTokenDiscriminator
 
 
 def _configure_espeak_library():
@@ -287,7 +288,7 @@ class NeuTTS:
             self.watermarker = None
 
         checkpoint_path = "/data2/minh_duc/TTS_spoofing/Segment_discriminator_len50/version_0/checkpoints/epoch=4-step=29675.ckpt"
-        self.discriminator = SegmentTokenDiscriminator(segment_len=50,
+        self.discriminator50 = SegmentTokenDiscriminator(segment_len=50,
                                 vocab_size=65536,
                                 d_model=256,
                                 nhead=8,
@@ -296,9 +297,69 @@ class NeuTTS:
                                 dropout=0.1,
                                 )
         state = torch.load(checkpoint_path, map_location="cpu")
-        self.discriminator.load_state_dict(state["model_state_dict"])
-        self.discriminator.eval()
-        self.discriminator.to(self.backbone.device)
+        self.discriminator50.load_state_dict(state["model_state_dict"])
+        self.discriminator50.eval()
+        self.discriminator50.to(self.backbone.device)
+
+        checkpoint_path = "/data2/minh_duc/TTS_spoofing/Strided_discriminator_seg50_scale10/version_0/epochepoch=4.ckpt"
+        self.discriminator50s10 = StridedSegmentTokenDiscriminator(
+                                    segment_len=50,   # 50
+                                    scale=10,               # 50 / 25 / 10
+                                    vocab_size=65536,
+                                    d_model=256,
+                                    nhead=8,
+                                    num_layers=4,
+                                    dim_feedforward=1024,
+                                    dropout=0.1,
+                                    )
+        state = torch.load(checkpoint_path, map_location="cpu")
+        self.discriminator50s10.load_state_dict(state["model_state_dict"])
+        self.discriminator50s10.eval()
+        self.discriminator50s10.to(self.backbone.device)
+
+        checkpoint_path = "/data2/minh_duc/TTS_spoofing/Strided_discriminator_seg50_scale25/version_0/epochepoch=4.ckpt"
+        self.discriminator50s25 = StridedSegmentTokenDiscriminator(
+                                    segment_len=50,   # 50
+                                    scale=25,               # 50 / 25 / 10
+                                    vocab_size=65536,
+                                    d_model=256,
+                                    nhead=8,
+                                    num_layers=4,
+                                    dim_feedforward=1024,
+                                    dropout=0.1,
+                                    )
+        state = torch.load(checkpoint_path, map_location="cpu")
+        self.discriminator50s25.load_state_dict(state["model_state_dict"])
+        self.discriminator50s25.eval()
+        self.discriminator50s25.to(self.backbone.device)
+
+        checkpoint_path = "/data2/minh_duc/TTS_spoofing/Segment_discriminator_len25/version_0/epochepoch=4.ckpt"
+        self.discriminator25 = SegmentTokenDiscriminator(segment_len=25,
+                                vocab_size=65536,
+                                d_model=256,
+                                nhead=8,
+                                num_layers=4,
+                                dim_feedforward=1024,
+                                dropout=0.1,
+                                )
+        state = torch.load(checkpoint_path, map_location="cpu")
+        self.discriminator25.load_state_dict(state["model_state_dict"])
+        self.discriminator25.eval()
+        self.discriminator25.to(self.backbone.device)
+
+        checkpoint_path = "/data2/minh_duc/TTS_spoofing/Segment_discriminator_len10/version_0/epochepoch=4.ckpt"
+        self.discriminator10 = SegmentTokenDiscriminator(segment_len=10,
+                                vocab_size=65536,
+                                d_model=256,
+                                nhead=8,
+                                num_layers=4,
+                                dim_feedforward=1024,
+                                dropout=0.1,
+                                )
+        state = torch.load(checkpoint_path, map_location="cpu")
+        self.discriminator10.load_state_dict(state["model_state_dict"])
+        self.discriminator10.eval()
+        self.discriminator10.to(self.backbone.device)
 
         # Speech token range (verified contiguous)
         self.speech_start_id = 128262
@@ -1042,7 +1103,7 @@ class NeuTTS:
             # Case 3: >=2 full chunks -> discriminator selection among full ones
             beam_speech_ids = [c["speech_ids"] for c in full]
             speech_tensor = torch.tensor(beam_speech_ids, device=device)  # [B, 50]
-            scores = self.discriminator(speech_tensor)
+            scores = self.discriminator50(speech_tensor)
             best = scores.argmax().item()
 
             chosen_lm_ids = full[best]["lm_ids"]
@@ -1229,7 +1290,7 @@ class NeuTTS:
             # Case 3: >=2 full chunks -> discriminator among full ones
             beam_speech_ids = [c["speech_ids"] for c in full]
             speech_tensor = torch.tensor(beam_speech_ids, device=device)  # [B, 50]
-            disc_scores = self.discriminator(speech_tensor)
+            disc_scores = self.discriminator50(speech_tensor)
             best = disc_scores.argmax().item()
 
             chosen_lm_ids = full[best]["lm_ids"]
@@ -1425,13 +1486,174 @@ class NeuTTS:
             beam_speech_ids = [c["speech_ids"] for c in full]
             speech_tensor = torch.tensor(beam_speech_ids, device=device)
 
-            scores = self.discriminator(speech_tensor)
+            scores = self.discriminator50(speech_tensor)
             best = scores.argmax().item()
 
             output = torch.cat(
                 [output, torch.tensor([full[best]["lm_ids"]], device=device)],
                 dim=1,
             )
+
+            if output.shape[1] >= max_length:
+                return output[:, :max_length]
+
+        return output[:, :max_length]
+    
+    @torch.no_grad()
+    def _hier_generate(
+        self,
+        prompt_tensor: torch.Tensor,
+        *,
+        max_length: int,
+        eos_token_id: int,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        warmup_len: int = 20,
+        segment_len: int = 50,
+        n_beams: int = 3,
+        max_lm_steps: int = 400,   # safety cap per chunk
+        # Phase-A weights (tune later)
+        w50: float = 1.0,
+        w50s25: float = 0.5,
+        w50s10: float = 0.25,
+    ):
+        device = prompt_tensor.device
+        output = prompt_tensor
+
+        # -------- warmup (LM tokens, no discriminator) --------
+        warmup, _ = self._generate_chunk(
+            output,
+            max_new_tokens=warmup_len,
+            eos_token_id=eos_token_id,
+            temperature=temperature,
+            top_k=top_k,
+            past_key_values=None,  # TODO: later, thread pkv
+        )
+        if warmup is None:
+            return output
+
+        output = torch.cat([output, warmup], dim=1)
+        if warmup[0, -1].item() == eos_token_id:
+            return output
+
+        # -------- discriminator-guided chunks --------
+        while output.shape[1] < max_length:
+
+            candidates = []
+
+            for _ in range(n_beams):
+                input_ids = output
+                past_key_values = None
+
+                lm_ids = []
+                speech_ids = []
+                ended_with_eos = False
+                ended_by_cap = False
+
+                for step in range(max_lm_steps):
+                    outputs = self.backbone(
+                        input_ids=input_ids if past_key_values is None else input_ids[:, -1:],
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                    )
+                    logits = outputs.logits[:, -1, :] / max(temperature, 1e-8)
+                    past_key_values = outputs.past_key_values
+
+                    if top_k > 0:
+                        v, idx = torch.topk(logits, top_k)
+                        probs = torch.softmax(v, dim=-1)
+                        next_id = idx[0, torch.multinomial(probs[0], 1)].item()
+                    else:
+                        probs = torch.softmax(logits, dim=-1)
+                        next_id = torch.multinomial(probs, 1).item()
+
+                    lm_ids.append(next_id)
+                    input_ids = torch.tensor([[next_id]], device=device)
+
+                    # ---- EOS handling ----
+                    if next_id == eos_token_id:
+                        ended_with_eos = True
+                        break
+
+                    # ---- collect speech tokens only ----
+                    if self.speech_start_id <= next_id < self.speech_end_id:
+                        speech_ids.append(next_id - self.speech_start_id)
+                        if len(speech_ids) == segment_len:
+                            break
+
+                # If we exited because we exhausted max_lm_steps without eos and without full segment
+                if (not ended_with_eos) and (len(speech_ids) < segment_len) and (len(lm_ids) >= max_lm_steps):
+                    ended_by_cap = True
+
+                candidates.append(
+                    {
+                        "lm_ids": lm_ids,
+                        "speech_ids": speech_ids,
+                        "ended_with_eos": ended_with_eos,
+                        "ended_by_cap": ended_by_cap,
+                    }
+                )
+
+            # Partition candidates
+            full = [c for c in candidates if len(c["speech_ids"]) == segment_len]
+            partial = [c for c in candidates if len(c["speech_ids"]) < segment_len]  # includes eos + cap
+
+            # Case 1: all less than segment_len (no full chunk)
+            if len(full) == 0:
+                if len(partial) == 0:
+                    return output  # nothing generated at all (shouldn't happen)
+
+                best_partial = max(
+                    partial,
+                    key=lambda c: (len(c["speech_ids"]), len(c["lm_ids"]))
+                )
+
+                chosen_lm_ids = best_partial["lm_ids"]
+                if not chosen_lm_ids:
+                    return output
+
+                output = torch.cat([output, torch.tensor([chosen_lm_ids], device=device)], dim=1)
+
+                if best_partial["ended_with_eos"] or best_partial["ended_by_cap"]:
+                    return output[:, :max_length] if output.shape[1] > max_length else output
+
+                if output.shape[1] >= max_length:
+                    return output[:, :max_length]
+                continue
+
+            # Case 2: exactly one full chunk -> continue with it (no discriminator)
+            if len(full) == 1:
+                chosen_lm_ids = full[0]["lm_ids"]
+                if not chosen_lm_ids:
+                    return output
+
+                output = torch.cat([output, torch.tensor([chosen_lm_ids], device=device)], dim=1)
+                if output.shape[1] >= max_length:
+                    return output[:, :max_length]
+                continue
+
+            # Case 3: >=2 full chunks -> hierarchical selection among full ones
+            beam_speech_ids = [c["speech_ids"] for c in full]
+            speech_tensor = torch.tensor(beam_speech_ids, device=device)  # [B, 50]
+
+            # Each discriminator returns a score per beam (assumed logits-ish)
+            s50 = self.discriminator50(speech_tensor)
+            s50s25 = self.discriminator50s25(speech_tensor)
+            s50s10 = self.discriminator50s10(speech_tensor)
+
+            # Convert to probability-like scale before weighting
+            p50 = torch.sigmoid(s50)
+            p50s25 = torch.sigmoid(s50s25)
+            p50s10 = torch.sigmoid(s50s10)
+
+            combined = (w50 * p50) + (w50s25 * p50s25) + (w50s10 * p50s10)
+            best = combined.argmax().item()
+
+            chosen_lm_ids = full[best]["lm_ids"]
+            if not chosen_lm_ids:
+                return output
+
+            output = torch.cat([output, torch.tensor([chosen_lm_ids], device=device)], dim=1)
 
             if output.shape[1] >= max_length:
                 return output[:, :max_length]
@@ -1535,6 +1757,21 @@ class NeuTTS:
                     cap=0.8,             # slightly softer cap than standalone eas
                     top_p=0.8,
                     sample_top_k=50,
+                )
+            elif sampling_scheme == "hier":
+                output_tokens = self._hier_generate(
+                    prompt_tensor,
+                    max_length=self.max_context,
+                    eos_token_id=speech_end_id,
+                    temperature=1.0,
+                    top_k=50,
+                    warmup_len=20,
+                    segment_len=50,
+                    n_beams=3,
+                    # optional: tune later
+                    w50=1.0,
+                    w50s25=0.5,
+                    w50s10=0.25,
                 )
 
         input_length = prompt_tensor.shape[-1]
