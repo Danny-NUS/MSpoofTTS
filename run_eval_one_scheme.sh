@@ -21,22 +21,25 @@
 # DATASET CONFIG
 # ========================
 
-DATA_DIR="/data/datasets/libritts_test_clean"
-RESULT_ROOT="/data/results/libritts_test_clean"
+# DATA_DIR="/data2/minh_duc/from_hf/libritts/new.test.clean" # libritts
+# DATA_DIR="/data2/minh_duc/from_hf/librispeech_asr/test.clean" # librispeech
+DATA_DIR="/data2/minh_duc/from_hf/badayvedat_vctk/validation" # VCTK
+RESULT_ROOT="/data2/minh_duc/neutts_eval/vctk"
 
 # ========================
 # EXPERIMENT CONFIG
 # ========================
 
-SCHEME="ASR_GT"
+SCHEME="orig"
 
 # ASR model options:
 #   openai/whisper-large-v3
 #   facebook/wav2vec2-large-960h
 #   facebook/wav2vec2-large-960h-lv60-self
-ASR_MODEL="facebook/wav2vec2-large-960h"
+ASR_MODEL="openai/whisper-large-v3"
+# ASR_MODEL="facebook/wav2vec2-large-960h"
 
-MAX_UTTS=100
+MAX_UTTS=None
 N_SYN=1
 SEED=42
 
@@ -60,5 +63,5 @@ python3 eval_one_scheme.py \
     --result_root ${RESULT_ROOT} \
     --n_syn_per_utt ${N_SYN} \
     --seed ${SEED} \
-    --max_utts ${MAX_UTTS} \
     --nisqa
+    # --max_utts ${MAX_UTTS} \

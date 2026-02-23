@@ -445,8 +445,14 @@ def init_or_load_summary(summary_path: Path, meta: Dict[str, Any]) -> Dict[str, 
         r.setdefault("count", 0)
         r.setdefault("sum_wer", 0.0)
         r.setdefault("sum_cer", 0.0)
-        r.setdefault("sum_sim", 0.0)
-        r.setdefault("count_sim", 0)
+
+        r.setdefault("sum_sim_same", 0.0)
+        r.setdefault("count_sim_same", 0)
+        r.setdefault("sum_sim_diff", 0.0)
+        r.setdefault("count_sim_diff", 0)
+        r.setdefault("sum_sim_margin", 0.0)
+        r.setdefault("count_sim_margin", 0)
+
         r.setdefault("sum_rtf", 0.0)
         r.setdefault("count_rtf", 0)
         r.setdefault("nisqa", {"count": 0, "sum_overall": 0.0, "sum_noisiness": 0.0,
@@ -462,7 +468,11 @@ def init_or_load_summary(summary_path: Path, meta: Dict[str, Any]) -> Dict[str, 
         "num_samples": 0,
         "avg_wer": None,
         "avg_cer": None,
-        "avg_sim_score": None,
+        
+        "avg_sim_same": None,
+        "avg_sim_diff": None,
+        "avg_sim_margin": None,
+
         "avg_rtf": None,
         "avg_nisqa_overall": None,
         "avg_nisqa_noisiness": None,
@@ -473,8 +483,14 @@ def init_or_load_summary(summary_path: Path, meta: Dict[str, Any]) -> Dict[str, 
             "count": 0,
             "sum_wer": 0.0,
             "sum_cer": 0.0,
-            "sum_sim": 0.0,
-            "count_sim": 0,
+
+            "sum_sim_same": 0.0,
+            "count_sim_same": 0,
+            "sum_sim_diff": 0.0,
+            "count_sim_diff": 0,
+            "sum_sim_margin": 0.0,
+            "count_sim_margin": 0,
+            
             "sum_rtf": 0.0,
             "count_rtf": 0,
             "sum_gpu_peak_mb": 0.0,
@@ -498,10 +514,20 @@ def update_summary(summary: Dict[str, Any], record: Dict[str, Any]) -> None:
     r["sum_wer"] += float(record["wer"])
     r["sum_cer"] += float(record["cer"])
 
-    sim = record.get("sim_score", None)
-    if sim is not None:
-        r["sum_sim"] += float(sim)
-        r["count_sim"] += 1
+    sim_same = record.get("sim_same", None)
+    if sim_same is not None:
+        r["sum_sim_same"] += float(sim_same)
+        r["count_sim_same"] += 1
+
+    sim_diff = record.get("sim_diff", None)
+    if sim_diff is not None:
+        r["sum_sim_diff"] += float(sim_diff)
+        r["count_sim_diff"] += 1
+
+    sim_margin = record.get("sim_margin", None)
+    if sim_margin is not None:
+        r["sum_sim_margin"] += float(sim_margin)
+        r["count_sim_margin"] += 1
 
     rtf = record.get("rtf", None)
     if rtf is not None:
@@ -528,10 +554,20 @@ def update_summary(summary: Dict[str, Any], record: Dict[str, Any]) -> None:
     summary["avg_wer"] = r["sum_wer"] / r["count"]
     summary["avg_cer"] = r["sum_cer"] / r["count"]
 
-    if r["count_sim"] > 0:
-        summary["avg_sim_score"] = r["sum_sim"] / r["count_sim"]
+    if r["count_sim_same"] > 0:
+        summary["avg_sim_same"] = r["sum_sim_same"] / r["count_sim_same"]
     else:
-        summary["avg_sim_score"] = None
+        summary["avg_sim_same"] = None
+
+    if r["count_sim_diff"] > 0:
+        summary["avg_sim_diff"] = r["sum_sim_diff"] / r["count_sim_diff"]
+    else:
+        summary["avg_sim_diff"] = None
+
+    if r["count_sim_margin"] > 0:
+        summary["avg_sim_margin"] = r["sum_sim_margin"] / r["count_sim_margin"]
+    else:
+        summary["avg_sim_margin"] = None
 
     if r["count_rtf"] > 0:
         summary["avg_rtf"] = r["sum_rtf"] / r["count_rtf"]
@@ -659,7 +695,7 @@ def run_scheme(
 
     # main loop
     for spk, utts in tqdm(spk2utts.items(), desc="Speakers"):
-        if scheme != "ASR_GT" and len(utts) < 2:
+        if scheme != "ASR_GT" and len(utts) < 3:
             continue
 
         for ex in tqdm(utts, desc=f"Utts spk={spk}", leave=False):
@@ -710,7 +746,9 @@ def run_scheme(
                         "duration_sec": audio_duration_sec(wav_gt_16k, 16000),
                         "gen_time_sec": None,
                         "rtf": None,
-                        "sim_score": None,
+                        "sim_same": None,
+                        "sim_diff": None,
+                        "sim_margin": None,
                         "gpu_peak_mem_mb": None,
                     }
 
@@ -798,15 +836,34 @@ def run_scheme(
                     w = wer(gt_n, pred_n)
                     c = cer(gt_n, pred_n)
 
-                    # SIM score
-                    sim_score = 0.0
-                    sim_score = sim_model.similarity(
-                        wav_ref_16k,
-                        16000,
-                        wav_16k_t,
-                        16000
-                    )
+                    # ------------------------------
+                    # Speaker similarity (anchor-based, with negative)
+                    # ------------------------------
 
+                    # same-speaker anchor: not GT, not ref
+                    anchor_pool = [u for u in utts if u["utt_id"] not in {utt_id, ref_id}]
+
+                    sim_same = None
+                    sim_diff = None
+                    sim_margin = None
+
+                    if len(anchor_pool) > 0:
+                        anchor_ex = random.choice(anchor_pool)
+                        wav_anchor_16k = torch.tensor(anchor_ex["audio_16k"], dtype=torch.float32)
+
+                        # same speaker similarity
+                        sim_same = sim_model.similarity(wav_anchor_16k, 16000, wav_16k_t, 16000)
+
+                        # different speaker similarity
+                        other_spks = [s for s in spk2utts.keys() if s != spk]
+                        if len(other_spks) > 0:
+                            spk_neg = random.choice(other_spks)
+                            neg_ex = random.choice(spk2utts[spk_neg])
+                            wav_neg_16k = torch.tensor(neg_ex["audio_16k"], dtype=torch.float32)
+
+                            sim_diff = sim_model.similarity(wav_neg_16k, 16000, wav_16k_t, 16000)
+
+                            sim_margin = sim_same - sim_diff
 
                     record = {
                         "key": key,
@@ -824,7 +881,9 @@ def run_scheme(
                         "duration_sec": float(dur),
                         "gen_time_sec": float(gen_time),
                         "rtf": float(rtf),
-                        "sim_score": sim_score,
+                        "sim_same": sim_same,
+                        "sim_diff": sim_diff,
+                        "sim_margin": sim_margin,
                         "gpu_peak_mem_mb": gpu_peak_mb,
                     }
 
