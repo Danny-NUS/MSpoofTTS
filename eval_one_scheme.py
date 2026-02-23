@@ -50,7 +50,8 @@ DEFAULT_MAX_UTTS: Optional[int] = 100  # set None for full
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Schemes allowed for TTS synthesis
-sampling_schemes = ["orig", "ras_k50_win25", "dis", "ras_dis", "eas", "recon", "eas_dis", "hier"]  # add more here
+sampling_schemes = ["orig", "ras_k50_win25", "dis", "ras_dis", "eas", 
+                    "recon", "eas_dis", "hier", "ras_hier", "eas_hier"]  # add more here
 
 # =========================
 # Optional NISQA

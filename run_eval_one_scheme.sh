@@ -12,9 +12,11 @@
 #   - eas
 #   - eas_dis
 #   - hier
+#   - ras_hier
+#   - eas_hier
 # ========================================
 
-SCHEME="hier"
+SCHEME="ras_hier"
 MAX_UTTS=100
 N_SYN=1
 SEED=42
