@@ -24,6 +24,7 @@ from jiwer import Compose, ToLowerCase, RemovePunctuation, RemoveMultipleSpaces,
 from num2words import num2words
 
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
+from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector
 
 # =========================
 # ENV BOOTSTRAP (CRITICAL)
@@ -70,47 +71,69 @@ except Exception:
 
 
 # =========================
-# Speaker Similarity: ECAPA-TDNN
+# Speaker Similarity: WAV-LM for speaker verification
 # =========================
 
 class SpeakerSimilarity:
     def __init__(self, device="cuda"):
         self.device = device
-        self.model = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb",
-            run_opts={"device": device}
+
+        self.feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
+            "microsoft/wavlm-base-plus-sv"
         )
+
+        self.model = WavLMForXVector.from_pretrained(
+            "microsoft/wavlm-base-plus-sv"
+        ).to(device)
+
+        self.model.eval()
 
     @torch.no_grad()
     def embedding(self, wav: torch.Tensor, sr: int):
-        # Resample to 16k if needed
+        """
+        wav: [T] float tensor
+        """
+
+        # resample to 16k (required)
         if sr != 16000:
             wav = torchaudio.functional.resample(
                 wav.unsqueeze(0), sr, 16000
             ).squeeze(0)
 
-        # Ensure shape [1, T]
         if wav.ndim == 1:
             wav = wav.unsqueeze(0)
 
         wav = wav.to(self.device)
 
-        emb = self.model.encode_batch(wav)
+        inputs = self.feature_extractor(
+            wav.squeeze(0).cpu().numpy(),
+            sampling_rate=16000,
+            return_tensors="pt"
+        )
 
-        # emb shape usually [1, 1, 192] or [1, 192]
-        emb = emb.squeeze()
+        input_values = inputs.input_values.to(self.device)
 
-        # Now should be [192]
+        outputs = self.model(input_values)
+
+        # xvector shape: [1, 512]
+        if hasattr(outputs, "xvector"):
+            emb = outputs.xvector.squeeze(0)
+        elif hasattr(outputs, "embeddings"):
+            emb = outputs.embeddings.squeeze(0)
+        else:
+            raise RuntimeError("Unexpected WavLM output format")
+
+        # L2 normalize (important for cosine stability)
+        emb = F.normalize(emb, p=2, dim=0)
+
         return emb
 
     @torch.no_grad()
     def similarity(self, wav_ref, sr_ref, wav_syn, sr_syn):
         emb_ref = self.embedding(wav_ref, sr_ref)
         emb_syn = self.embedding(wav_syn, sr_syn)
-        sim = F.cosine_similarity(emb_ref, emb_syn, dim=0)
 
-        if sim.ndim > 0:
-            sim = sim.squeeze()
+        sim = torch.dot(emb_ref, emb_syn)
 
         return float(sim.item())
 
@@ -351,6 +374,8 @@ def init_or_load_summary(summary_path: Path, meta: Dict[str, Any]) -> Dict[str, 
         r.setdefault("count_rtf", 0)
         r.setdefault("nisqa", {"count": 0, "sum_overall": 0.0, "sum_noisiness": 0.0,
                                "sum_discontinuity": 0.0, "sum_coloration": 0.0, "sum_loudness": 0.0})
+        r.setdefault("sum_gpu_peak_mb", 0.0)
+        r.setdefault("count_gpu_peak", 0)
         existing.setdefault("meta", meta)
         return existing
 
@@ -375,6 +400,8 @@ def init_or_load_summary(summary_path: Path, meta: Dict[str, Any]) -> Dict[str, 
             "count_sim": 0,
             "sum_rtf": 0.0,
             "count_rtf": 0,
+            "sum_gpu_peak_mb": 0.0,
+            "count_gpu_peak": 0,
             "nisqa": {
                 "count": 0,
                 "sum_overall": 0.0,
@@ -404,6 +431,11 @@ def update_summary(summary: Dict[str, Any], record: Dict[str, Any]) -> None:
         r["sum_rtf"] += float(rtf)
         r["count_rtf"] += 1
 
+    gpu = record.get("gpu_peak_mem_mb", None)
+    if gpu is not None:
+        r["sum_gpu_peak_mb"] += float(gpu)
+        r["count_gpu_peak"] += 1
+
     # NISQA
     if "nisqa_overall" in record:
         rn = r["nisqa"]
@@ -428,6 +460,13 @@ def update_summary(summary: Dict[str, Any], record: Dict[str, Any]) -> None:
         summary["avg_rtf"] = r["sum_rtf"] / r["count_rtf"]
     else:
         summary["avg_rtf"] = None
+
+    if r["count_gpu_peak"] > 0:
+        summary["avg_gpu_peak_mem_mb"] = (
+            r["sum_gpu_peak_mb"] / r["count_gpu_peak"]
+        )
+    else:
+        summary["avg_gpu_peak_mem_mb"] = None
 
     rn = r["nisqa"]
     if rn["count"] > 0:
@@ -684,7 +723,7 @@ def run_scheme(
                     # SIM score
                     sim_score = 0.0
                     sim_score = sim_model.similarity(
-                        wav_gt_16k,
+                        wav_ref_16k,
                         16000,
                         wav_16k_t,
                         16000
