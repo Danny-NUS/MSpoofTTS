@@ -42,14 +42,13 @@ from neutts import NeuTTS
 # =========================
 # CONFIG 
 # =========================
-
-SYN_ROOT = Path("/data2/minh_duc/neutts/libritts/infer100/syn.test.clean")
-ASR_ROOT = Path("/data2/minh_duc/neutts/libritts/infer100/asr.test.clean")
+SYN_ROOT = None
+ASR_ROOT = None
 
 # default knobs (override via CLI)
 DEFAULT_N_SYN_PER_UTT = 1
 DEFAULT_SEED = 42
-DEFAULT_MAX_UTTS: Optional[int] = 100  # set None for full
+DEFAULT_MAX_UTTS: Optional[int] = None  # set None for full
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -265,29 +264,76 @@ def append_done_key(done_path: Path, key: str) -> None:
 
 
 # =========================
-# LOAD HF DATASET
+# LOAD KALDI DATASET
 # =========================
 
-def load_hf_libritts(max_utts: Optional[int] = None):
-    ds = load_dataset(
-        "mythicinfinity/libritts",
-        "clean",
-        split="test.clean"
-    ).cast_column("audio", Audio(sampling_rate=16000))
+def load_kaldi_dataset(data_dir: Path, max_utts: Optional[int] = None):
+    """
+    Expects:
+      wav.scp
+      text
+      utt2spk
+    """
+
+    wav_scp_path = data_dir / "wav.scp"
+    text_path = data_dir / "text"
+    utt2spk_path = data_dir / "utt2spk"
+
+    assert wav_scp_path.exists(), f"Missing {wav_scp_path}"
+    assert text_path.exists(), f"Missing {text_path}"
+    assert utt2spk_path.exists(), f"Missing {utt2spk_path}"
+
+    # Load wav.scp
+    wav_map = {}
+    with open(wav_scp_path) as f:
+        for line in f:
+            utt, path = line.strip().split(maxsplit=1)
+            wav_map[utt] = path
+
+    # Load text
+    text_map = {}
+    with open(text_path) as f:
+        for line in f:
+            parts = line.strip().split(maxsplit=1)
+            utt = parts[0]
+            txt = parts[1] if len(parts) > 1 else ""
+            text_map[utt] = txt
+
+    # Load utt2spk
+    spk_map = {}
+    with open(utt2spk_path) as f:
+        for line in f:
+            utt, spk = line.strip().split()
+            spk_map[utt] = spk
+
+    # Intersect valid utts
+    utt_ids = sorted(set(wav_map) & set(text_map) & set(spk_map))
 
     if max_utts is not None:
-        ds = ds.select(range(min(max_utts, len(ds))))
+        utt_ids = utt_ids[:max_utts]
 
-    return [
-        {
-            "utt_id": ex["id"],
-            "speaker_id": ex["speaker_id"],
-            "text": ex["text_normalized"],
-            "audio_16k": ex["audio"]["array"],  # numpy
-        }
-        for ex in ds
-    ]
+    examples = []
 
+    for utt in utt_ids:
+        wav_path = wav_map[utt]
+
+        wav, sr = torchaudio.load(wav_path)
+
+        if wav.ndim > 1:
+            wav = wav.mean(dim=0)  # mono
+
+        # Resample to 16k for consistency
+        if sr != 16000:
+            wav = torchaudio.functional.resample(wav, sr, 16000)
+
+        examples.append({
+            "utt_id": utt,
+            "speaker_id": spk_map[utt],
+            "text": text_map[utt],
+            "audio_16k": wav.numpy(),
+        })
+
+    return examples
 
 # =========================
 # BASE ASR
@@ -826,6 +872,20 @@ def parse_args():
     allowed = ["ASR_GT"] + sampling_schemes
     p = argparse.ArgumentParser()
 
+    p.add_argument(
+        "--result_root",
+        type=str,
+        required=True,
+        help="Root directory to store results (will create syn/ and asr/ inside)"
+    )
+
+    p.add_argument(
+        "--data_dir",
+        type=str,
+        required=True,
+        help="Path to Kaldi-style dataset directory (contains wav.scp, text, utt2spk)"
+    )
+
     p.add_argument("--scheme", type=str, required=True)
     p.add_argument("--asr", type=str, required=True,
                    help="ASR model tag, e.g. whisper-large-v3 or wav2vec2-large-960h")
@@ -843,12 +903,20 @@ if __name__ == "__main__":
     args = parse_args()
     max_utts = None if args.max_utts == -1 else args.max_utts
 
+    RESULT_ROOT = Path(args.result_root)
+    SYN_ROOT = RESULT_ROOT / "syn"
+    ASR_ROOT = RESULT_ROOT / "asr"
+
+    SYN_ROOT.mkdir(parents=True, exist_ok=True)
+    ASR_ROOT.mkdir(parents=True, exist_ok=True)
+
     allowed = set(["ASR_GT"] + sampling_schemes)
     if args.scheme not in allowed:
         raise ValueError(f"--scheme {args.scheme} not in {sorted(allowed)}")
 
-    print("Loading LibriTTS from HuggingFace...")
-    examples = load_hf_libritts(max_utts=max_utts)
+    data_dir = Path(args.data_dir)
+    print(f"Loading Kaldi dataset from {data_dir}")
+    examples = load_kaldi_dataset(data_dir, max_utts=max_utts)
     print(f"Loaded {len(examples)} utterances")
 
     run_scheme(

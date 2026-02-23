@@ -18,7 +18,14 @@
 # ========================================
 
 # ========================
-# CONFIG
+# DATASET CONFIG
+# ========================
+
+DATA_DIR="/data/datasets/libritts_test_clean"
+RESULT_ROOT="/data/results/libritts_test_clean"
+
+# ========================
+# EXPERIMENT CONFIG
 # ========================
 
 SCHEME="ASR_GT"
@@ -27,7 +34,6 @@ SCHEME="ASR_GT"
 #   openai/whisper-large-v3
 #   facebook/wav2vec2-large-960h
 #   facebook/wav2vec2-large-960h-lv60-self
-# ASR_MODEL="openai/whisper-large-v3"
 ASR_MODEL="facebook/wav2vec2-large-960h"
 
 MAX_UTTS=100
@@ -38,14 +44,20 @@ SEED=42
 # RUN
 # ========================
 
-echo "Running scheme: ${SCHEME}"
+echo "======================================"
+echo "Dataset: ${DATA_DIR}"
+echo "Result root: ${RESULT_ROOT}"
+echo "Scheme: ${SCHEME}"
 echo "ASR model: ${ASR_MODEL}"
 echo "Max utts: ${MAX_UTTS}"
 echo "Seed: ${SEED}"
+echo "======================================"
 
 python3 eval_one_scheme.py \
     --scheme ${SCHEME} \
     --asr ${ASR_MODEL} \
+    --data_dir ${DATA_DIR} \
+    --result_root ${RESULT_ROOT} \
     --n_syn_per_utt ${N_SYN} \
     --seed ${SEED} \
     --max_utts ${MAX_UTTS} \
