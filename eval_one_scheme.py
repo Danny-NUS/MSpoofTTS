@@ -25,6 +25,7 @@ from num2words import num2words
 
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector
+from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
 
 # =========================
 # ENV BOOTSTRAP (CRITICAL)
@@ -44,7 +45,6 @@ from neutts import NeuTTS
 
 SYN_ROOT = Path("/data2/minh_duc/neutts/libritts/infer100/syn.test.clean")
 ASR_ROOT = Path("/data2/minh_duc/neutts/libritts/infer100/asr.test.clean")
-ASR_TAG = "whisper-large-v3"
 
 # default knobs (override via CLI)
 DEFAULT_N_SYN_PER_UTT = 1
@@ -290,24 +290,21 @@ def load_hf_libritts(max_utts: Optional[int] = None):
 
 
 # =========================
-# WHISPER ASR
+# BASE ASR
 # =========================
 
-class WhisperASR:
-    def __init__(self, tag: str):
-        # currently tag controls directory naming; model id is fixed to whisper-large-v3
-        self.tag = tag
-        self.processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3")
-        self.model = WhisperForConditionalGeneration.from_pretrained(
-            "openai/whisper-large-v3"
-        ).to(DEVICE)
+class BaseASR:
+    def transcribe_16k(self, wav_16k: torch.Tensor) -> str:
+        raise NotImplementedError
+
+class WhisperASR(BaseASR):
+    def __init__(self, model_id: str):
+        self.processor = WhisperProcessor.from_pretrained(model_id)
+        self.model = WhisperForConditionalGeneration.from_pretrained(model_id).to(DEVICE)
         self.model.eval()
 
     @torch.no_grad()
     def transcribe_16k(self, wav_16k: torch.Tensor) -> str:
-        """
-        wav_16k: torch.Tensor [T], float, 16kHz
-        """
         inputs = self.processor(
             wav_16k.detach().cpu().numpy(),
             sampling_rate=16000,
@@ -319,8 +316,42 @@ class WhisperASR:
             language="en",
             task="transcribe"
         )
-        return self.processor.decode(pred_ids[0], skip_special_tokens=True)
 
+        return self.processor.decode(pred_ids[0], skip_special_tokens=True)
+    
+class Wav2Vec2ASR(BaseASR):
+    def __init__(self, model_id: str):
+        self.processor = Wav2Vec2Processor.from_pretrained(model_id)
+        self.model = Wav2Vec2ForCTC.from_pretrained(model_id).to(DEVICE)
+        self.model.eval()
+
+    @torch.no_grad()
+    def transcribe_16k(self, wav_16k: torch.Tensor) -> str:
+        inputs = self.processor(
+            wav_16k.detach().cpu().numpy(),
+            sampling_rate=16000,
+            return_tensors="pt"
+        ).to(DEVICE)
+
+        logits = self.model(**inputs).logits
+        pred_ids = torch.argmax(logits, dim=-1)
+
+        transcription = self.processor.batch_decode(pred_ids)[0]
+        return transcription.lower()
+    
+def load_asr_model(asr_tag: str) -> BaseASR:
+    tag = asr_tag.lower()
+
+    if "whisper" in tag:
+        print(f"Loading Whisper ASR: {asr_tag}")
+        return WhisperASR(asr_tag)
+
+    elif "wav2vec2" in tag:
+        print(f"Loading Wav2Vec2 ASR: {asr_tag}")
+        return Wav2Vec2ASR(asr_tag)
+
+    else:
+        raise ValueError(f"Unsupported ASR tag: {asr_tag}")
 
 # =========================
 # NISQA
@@ -490,14 +521,14 @@ def update_summary(summary: Dict[str, Any], record: Dict[str, Any]) -> None:
 # PATHS PER SCHEME
 # =========================
 
-def get_scheme_dirs(scheme: str) -> Tuple[Path, Path]:
+def get_scheme_dirs(scheme: str, asr_tag: str) -> Tuple[Path, Path]:
     """
     Returns:
       syn_wav_dir: SYN_ROOT/<scheme>/wav
       asr_scheme_dir: ASR_ROOT/<ASR_TAG>/<scheme>
     """
     syn_wav_dir = SYN_ROOT / scheme / "wav"
-    asr_scheme_dir = ASR_ROOT / ASR_TAG / scheme
+    asr_scheme_dir = ASR_ROOT / asr_tag / scheme
     syn_wav_dir.mkdir(parents=True, exist_ok=True)
     asr_scheme_dir.mkdir(parents=True, exist_ok=True)
     return syn_wav_dir, asr_scheme_dir
@@ -514,6 +545,7 @@ def run_scheme(
     seed: int,
     max_utts: Optional[int],
     enable_nisqa: bool,
+    asr_tag: str,
 ) -> None:
     allowed = set(["ASR_GT"] + sampling_schemes)
     assert scheme in allowed, f"scheme={scheme} not in allowed={sorted(allowed)}"
@@ -521,7 +553,7 @@ def run_scheme(
     random.seed(seed)
     torch.manual_seed(seed)
 
-    syn_wav_dir, asr_scheme_dir = get_scheme_dirs(scheme)
+    syn_wav_dir, asr_scheme_dir = get_scheme_dirs(scheme, asr_tag)
 
     # files
     log_f = open(asr_scheme_dir / "process.log", "a")
@@ -532,7 +564,7 @@ def run_scheme(
 
     # meta + summary
     meta = {
-        "asr_model": ASR_TAG,
+        "asr_model": asr_tag,
         "date_started": now_iso(),
         "scheme": scheme,
         "sampling_schemes_allowed": sampling_schemes,
@@ -554,7 +586,7 @@ def run_scheme(
         spk2utts[ex["speaker_id"]].append(ex)
 
     # models
-    asr = WhisperASR(tag=ASR_TAG)
+    asr = load_asr_model(asr_tag)
 
     tts = None
     if scheme != "ASR_GT":
@@ -793,16 +825,17 @@ def run_scheme(
 def parse_args():
     allowed = ["ASR_GT"] + sampling_schemes
     p = argparse.ArgumentParser()
-    p.add_argument(
-        "--scheme",
-        type=str,
-        required=True,
-        help=f"One scheme to run. Allowed: {allowed}",
-    )
+
+    p.add_argument("--scheme", type=str, required=True)
+    p.add_argument("--asr", type=str, required=True,
+                   help="ASR model tag, e.g. whisper-large-v3 or wav2vec2-large-960h")
+
     p.add_argument("--n_syn_per_utt", type=int, default=DEFAULT_N_SYN_PER_UTT)
     p.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    p.add_argument("--max_utts", type=int, default=(DEFAULT_MAX_UTTS if DEFAULT_MAX_UTTS is not None else -1))
-    p.add_argument("--nisqa", action="store_true", help="Enable NISQA (requires torchmetrics).")
+    p.add_argument("--max_utts", type=int,
+                   default=(DEFAULT_MAX_UTTS if DEFAULT_MAX_UTTS is not None else -1))
+    p.add_argument("--nisqa", action="store_true")
+
     return p.parse_args()
 
 
@@ -825,4 +858,5 @@ if __name__ == "__main__":
         seed=args.seed,
         max_utts=max_utts,
         enable_nisqa=args.nisqa,
+        asr_tag=args.asr
     )
