@@ -20,6 +20,9 @@ import soundfile as sf
 from tqdm import tqdm
 from datasets import load_dataset, Audio
 from jiwer import wer, cer
+from jiwer import Compose, ToLowerCase, RemovePunctuation, RemoveMultipleSpaces, Strip
+from num2words import num2words
+
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
 # =========================
@@ -116,11 +119,54 @@ class SpeakerSimilarity:
 # UTILS
 # =========================
 
+# =========================
+# TEXT NORMALIZATION (WER SAFE)
+# =========================
+
+_jiwer_transform = Compose([
+    ToLowerCase(),
+    RemovePunctuation(),
+    RemoveMultipleSpaces(),
+    Strip(),
+])
+
+
+_number_regex = re.compile(r"\b\d+\b")
+
+
+def _expand_number(match):
+    try:
+        return num2words(int(match.group(0)))
+    except Exception:
+        return match.group(0)
+
+
 def normalize_text(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r"[^\w\s]", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
+    """
+    Standard ASR normalization:
+    - lowercase
+    - remove punctuation
+    - normalize numbers to words
+    - collapse spaces
+    """
+    text = _number_regex.sub(_expand_number, text)
+    text = _jiwer_transform(text)
     return text
+
+
+# =========================
+# CUDA tracking
+# =========================
+def reset_cuda_peak():
+    if DEVICE.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
+def get_cuda_peak_mb() -> Optional[float]:
+    if DEVICE.startswith("cuda") and torch.cuda.is_available():
+        peak = torch.cuda.max_memory_allocated()
+        return float(peak) / (1024 ** 2)
+    return None
 
 
 def save_wav(path: Path, wav: torch.Tensor, sr: int) -> None:
@@ -473,11 +519,16 @@ def run_scheme(
 
     tts = None
     if scheme != "ASR_GT":
+        use_dis = "dis" in scheme
+        use_hier = "hier" in scheme
+
         tts = NeuTTS(
             backbone_repo="neuphonic/neutts-nano",
             backbone_device="cuda",
             codec_repo="neuphonic/neucodec",
-            codec_device="cuda"
+            codec_device="cuda",
+            use_dis=use_dis,
+            use_hier=use_hier,
         )
 
     nisqa_metric = None
@@ -543,6 +594,7 @@ def run_scheme(
                         "gen_time_sec": None,
                         "rtf": None,
                         "sim_score": None,
+                        "gpu_peak_mem_mb": None,
                     }
 
                     asr_f.write(json.dumps(record) + "\n")
@@ -588,16 +640,22 @@ def run_scheme(
                         ref_codes = tts.encode_reference(str(tmp_ref))
 
                     # TTS inference timing (wall-clock, with cuda sync)
+                    reset_cuda_peak()
                     cuda_sync_if_needed()
+
                     t0 = time.perf_counter()
+
                     wav_24k = tts.infer(
                         gt_text,
                         ref_codes,
                         ref["text"],
                         sampling_scheme=scheme
                     )
+
                     cuda_sync_if_needed()
                     t1 = time.perf_counter()
+
+                    gpu_peak_mb = get_cuda_peak_mb()
 
                     gen_time = float(t1 - t0)
 
@@ -650,6 +708,7 @@ def run_scheme(
                         "gen_time_sec": float(gen_time),
                         "rtf": float(rtf),
                         "sim_score": sim_score,
+                        "gpu_peak_mem_mb": gpu_peak_mb,
                     }
 
                     # NISQA (optional)

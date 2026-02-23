@@ -245,6 +245,8 @@ class NeuTTS:
         backbone_device="cpu",
         codec_repo="neuphonic/neucodec",
         codec_device="cpu",
+        use_dis=False,
+        use_hier=False,
     ):
 
         # Consts
@@ -287,24 +289,9 @@ class NeuTTS:
             )
             self.watermarker = None
 
-        checkpoint_path = "/data2/minh_duc/TTS_spoofing/Segment_discriminator_len50/version_0/checkpoints/epoch=4-step=29675.ckpt"
-        self.discriminator50 = SegmentTokenDiscriminator(segment_len=50,
-                                vocab_size=65536,
-                                d_model=256,
-                                nhead=8,
-                                num_layers=4,
-                                dim_feedforward=1024,
-                                dropout=0.1,
-                                )
-        state = torch.load(checkpoint_path, map_location="cpu")
-        self.discriminator50.load_state_dict(state["model_state_dict"])
-        self.discriminator50.eval()
-        self.discriminator50.to(self.backbone.device)
-
-        checkpoint_path = "/data2/minh_duc/TTS_spoofing/Strided_discriminator_seg50_scale10/version_0/epochepoch=4.ckpt"
-        self.discriminator50s10 = StridedSegmentTokenDiscriminator(
-                                    segment_len=50,   # 50
-                                    scale=10,               # 50 / 25 / 10
+        if use_dis or use_hier:
+            checkpoint_path = "/data2/minh_duc/TTS_spoofing/Segment_discriminator_len50/version_0/checkpoints/epoch=4-step=29675.ckpt"
+            self.discriminator50 = SegmentTokenDiscriminator(segment_len=50,
                                     vocab_size=65536,
                                     d_model=256,
                                     nhead=8,
@@ -312,15 +299,46 @@ class NeuTTS:
                                     dim_feedforward=1024,
                                     dropout=0.1,
                                     )
-        state = torch.load(checkpoint_path, map_location="cpu")
-        self.discriminator50s10.load_state_dict(state["model_state_dict"])
-        self.discriminator50s10.eval()
-        self.discriminator50s10.to(self.backbone.device)
+            state = torch.load(checkpoint_path, map_location="cpu")
+            self.discriminator50.load_state_dict(state["model_state_dict"])
+            self.discriminator50.eval()
+            self.discriminator50.to(self.backbone.device)
 
-        checkpoint_path = "/data2/minh_duc/TTS_spoofing/Strided_discriminator_seg50_scale25/version_0/epochepoch=4.ckpt"
-        self.discriminator50s25 = StridedSegmentTokenDiscriminator(
-                                    segment_len=50,   # 50
-                                    scale=25,               # 50 / 25 / 10
+        if use_hier:
+            checkpoint_path = "/data2/minh_duc/TTS_spoofing/Strided_discriminator_seg50_scale10/version_0/epochepoch=4.ckpt"
+            self.discriminator50s10 = StridedSegmentTokenDiscriminator(
+                                        segment_len=50,   # 50
+                                        scale=10,               # 50 / 25 / 10
+                                        vocab_size=65536,
+                                        d_model=256,
+                                        nhead=8,
+                                        num_layers=4,
+                                        dim_feedforward=1024,
+                                        dropout=0.1,
+                                        )
+            state = torch.load(checkpoint_path, map_location="cpu")
+            self.discriminator50s10.load_state_dict(state["model_state_dict"])
+            self.discriminator50s10.eval()
+            self.discriminator50s10.to(self.backbone.device)
+
+            checkpoint_path = "/data2/minh_duc/TTS_spoofing/Strided_discriminator_seg50_scale25/version_0/epochepoch=4.ckpt"
+            self.discriminator50s25 = StridedSegmentTokenDiscriminator(
+                                        segment_len=50,   # 50
+                                        scale=25,               # 50 / 25 / 10
+                                        vocab_size=65536,
+                                        d_model=256,
+                                        nhead=8,
+                                        num_layers=4,
+                                        dim_feedforward=1024,
+                                        dropout=0.1,
+                                        )
+            state = torch.load(checkpoint_path, map_location="cpu")
+            self.discriminator50s25.load_state_dict(state["model_state_dict"])
+            self.discriminator50s25.eval()
+            self.discriminator50s25.to(self.backbone.device)
+
+            checkpoint_path = "/data2/minh_duc/TTS_spoofing/Segment_discriminator_len25/version_0/epochepoch=4.ckpt"
+            self.discriminator25 = SegmentTokenDiscriminator(segment_len=25,
                                     vocab_size=65536,
                                     d_model=256,
                                     nhead=8,
@@ -328,38 +346,24 @@ class NeuTTS:
                                     dim_feedforward=1024,
                                     dropout=0.1,
                                     )
-        state = torch.load(checkpoint_path, map_location="cpu")
-        self.discriminator50s25.load_state_dict(state["model_state_dict"])
-        self.discriminator50s25.eval()
-        self.discriminator50s25.to(self.backbone.device)
+            state = torch.load(checkpoint_path, map_location="cpu")
+            self.discriminator25.load_state_dict(state["model_state_dict"])
+            self.discriminator25.eval()
+            self.discriminator25.to(self.backbone.device)
 
-        checkpoint_path = "/data2/minh_duc/TTS_spoofing/Segment_discriminator_len25/version_0/epochepoch=4.ckpt"
-        self.discriminator25 = SegmentTokenDiscriminator(segment_len=25,
-                                vocab_size=65536,
-                                d_model=256,
-                                nhead=8,
-                                num_layers=4,
-                                dim_feedforward=1024,
-                                dropout=0.1,
-                                )
-        state = torch.load(checkpoint_path, map_location="cpu")
-        self.discriminator25.load_state_dict(state["model_state_dict"])
-        self.discriminator25.eval()
-        self.discriminator25.to(self.backbone.device)
-
-        checkpoint_path = "/data2/minh_duc/TTS_spoofing/Segment_discriminator_len10/version_0/epochepoch=4.ckpt"
-        self.discriminator10 = SegmentTokenDiscriminator(segment_len=10,
-                                vocab_size=65536,
-                                d_model=256,
-                                nhead=8,
-                                num_layers=4,
-                                dim_feedforward=1024,
-                                dropout=0.1,
-                                )
-        state = torch.load(checkpoint_path, map_location="cpu")
-        self.discriminator10.load_state_dict(state["model_state_dict"])
-        self.discriminator10.eval()
-        self.discriminator10.to(self.backbone.device)
+            checkpoint_path = "/data2/minh_duc/TTS_spoofing/Segment_discriminator_len10/version_0/epochepoch=4.ckpt"
+            self.discriminator10 = SegmentTokenDiscriminator(segment_len=10,
+                                    vocab_size=65536,
+                                    d_model=256,
+                                    nhead=8,
+                                    num_layers=4,
+                                    dim_feedforward=1024,
+                                    dropout=0.1,
+                                    )
+            state = torch.load(checkpoint_path, map_location="cpu")
+            self.discriminator10.load_state_dict(state["model_state_dict"])
+            self.discriminator10.eval()
+            self.discriminator10.to(self.backbone.device)
 
         # Speech token range (verified contiguous)
         self.speech_start_id = 128262

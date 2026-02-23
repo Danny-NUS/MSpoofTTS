@@ -16,7 +16,7 @@
 #   - eas_hier
 # ========================================
 
-SCHEME="eas_hier"
+SCHEME="orig"
 MAX_UTTS=100
 N_SYN=1
 SEED=42
