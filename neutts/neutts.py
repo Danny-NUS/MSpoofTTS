@@ -1961,6 +1961,225 @@ class NeuTTS:
 
         return output[:, :max_length]
 
+    @torch.no_grad()
+    def _eas_hier_generate(
+        self,
+        prompt_tensor: torch.Tensor,
+        *,
+        max_length: int,
+        eos_token_id: int,
+        temperature: float = 1.0,
+        top_k: int = 50,  # kept for compatibility
+        warmup_len: int = 20,
+        segment_len: int = 50,
+        n_beams: int = 6,
+        inner_beams_10: int | None = None,
+        inner_beams_25: int | None = None,
+        max_lm_steps: int = 400,
+        # Stage-50 weights
+        w50: float = 1.0,
+        w50s25: float = 0.5,
+        w50s10: float = 0.25,
+        # -------- EAS params --------
+        eas_top_k: int = 3,
+        alpha: float = 0.2,
+        beta: float = 0.7,
+        window: int = 15,
+        cap: float = 0.8,
+        top_p: float = 0.8,
+        sample_top_k: int = 25,
+    ):
+        device = prompt_tensor.device
+        output = prompt_tensor
+
+        # ===============================
+        # Warmup (EAS)
+        # ===============================
+        warmup_out = self._eas_generate(
+            output,
+            max_new_tokens=warmup_len,
+            eos_token_id=eos_token_id,
+            temperature=temperature,
+            min_new_tokens=warmup_len,
+            eas_top_k=eas_top_k,
+            alpha=alpha,
+            beta=beta,
+            window=window,
+            cap=cap,
+            top_p=top_p,
+            sample_top_k=sample_top_k,
+        )
+
+        output = warmup_out
+        if output[0, -1].item() == eos_token_id:
+            return output[:, :max_length]
+
+        if inner_beams_10 is None:
+            inner_beams_10 = max(2, math.ceil(n_beams / 2))
+        if inner_beams_25 is None:
+            inner_beams_25 = max(2, math.ceil(inner_beams_10 / 2))
+
+        # ============================================================
+        # EAS sampling helper (logits -> next_id)
+        # ============================================================
+        def _sample_next_id_eas(scores_1vocab: torch.Tensor, penalty_memory):
+            logits = scores_1vocab.squeeze(0)
+
+            if temperature != 1.0:
+                logits = logits / temperature
+
+            logits = self._mask_to_speech_only(logits, eos_token_id=eos_token_id)
+
+            penalty = penalty_memory.build_penalty_vector()
+            penalized_scores = logits - penalty
+
+            next_id = nucleus_sampling(
+                penalized_scores,
+                top_p=top_p,
+                top_k=sample_top_k,
+            )
+
+            # ===== penalty update =====
+            penalty_memory.step()
+            values, indices = torch.topk(penalized_scores, eas_top_k)
+            penalty_memory.update_cluster(indices)
+
+            return next_id
+
+        # ============================================================
+        # Advance helper (PKV preserved exactly like hier)
+        # ============================================================
+        def _advance_to_speech_len(c: dict, target_speech_len: int) -> dict:
+            while (
+                (not c["ended_with_eos"])
+                and (not c["ended_by_cap"])
+                and (len(c["speech_ids"]) < target_speech_len)
+            ):
+                if c["lm_steps_used"] >= max_lm_steps:
+                    c["ended_by_cap"] = True
+                    break
+
+                outputs = self.backbone(
+                    input_ids=c["input_ids"] if c["pkv"] is None else c["input_ids"][:, -1:],
+                    past_key_values=c["pkv"],
+                    use_cache=True,
+                )
+                logits = outputs.logits[:, -1, :]
+                c["pkv"] = outputs.past_key_values
+
+                next_id = _sample_next_id_eas(logits, c["penalty_memory"])
+
+                c["lm_ids"].append(next_id)
+                c["lm_steps_used"] += 1
+                c["input_ids"] = torch.tensor([[next_id]], device=device)
+
+                if next_id == eos_token_id:
+                    c["ended_with_eos"] = True
+                    break
+
+                if self.speech_start_id <= next_id < self.speech_end_id:
+                    c["speech_ids"].append(next_id - self.speech_start_id)
+
+            return c
+
+        def _best_longest(cands):
+            return max(cands, key=lambda c: (len(c["speech_ids"]), len(c["lm_ids"])))
+
+        def _select_topk_by_disc(full, disc_fn, k_keep):
+            speech_tensor = torch.tensor([c["speech_ids"] for c in full], device=device)
+            scores = disc_fn(speech_tensor)
+            k = min(k_keep, scores.shape[0])
+            idx = torch.topk(scores, k=k).indices.tolist()
+            return [full[i] for i in idx]
+
+        # ============================================================
+        # Main chunk loop
+        # ============================================================
+        while output.shape[1] < max_length:
+
+            candidates = []
+            for _ in range(n_beams):
+                candidates.append({
+                    "input_ids": output,
+                    "pkv": None,
+                    "lm_ids": [],
+                    "speech_ids": [],
+                    "ended_with_eos": False,
+                    "ended_by_cap": False,
+                    "lm_steps_used": 0,
+                    "penalty_memory": EASPenalty(
+                        vocab_size=self.backbone.config.vocab_size,
+                        alpha=alpha,
+                        beta=beta,
+                        window=window,
+                        cap=cap,
+                        device=device,
+                    ),
+                })
+
+            # ======================
+            # Stage 10
+            # ======================
+            for c in candidates:
+                _advance_to_speech_len(c, 10)
+
+            full10 = [c for c in candidates if len(c["speech_ids"]) == 10]
+            if len(full10) == 0:
+                best = _best_longest(candidates)
+                chosen = best["lm_ids"]
+                output = torch.cat([output, torch.tensor([chosen], device=device)], dim=1)
+                if best["ended_with_eos"] or best["ended_by_cap"]:
+                    return output[:, :max_length]
+                continue
+
+            survivors_10 = full10 if len(full10) == 1 else _select_topk_by_disc(full10, self.discriminator10, inner_beams_10)
+
+            # ======================
+            # Stage 25
+            # ======================
+            for c in survivors_10:
+                _advance_to_speech_len(c, 25)
+
+            full25 = [c for c in survivors_10 if len(c["speech_ids"]) == 25]
+            if len(full25) == 0:
+                best = _best_longest(survivors_10)
+                chosen = best["lm_ids"]
+                output = torch.cat([output, torch.tensor([chosen], device=device)], dim=1)
+                continue
+
+            survivors_25 = full25 if len(full25) == 1 else _select_topk_by_disc(full25, self.discriminator25, inner_beams_25)
+
+            # ======================
+            # Stage 50
+            # ======================
+            for c in survivors_25:
+                _advance_to_speech_len(c, segment_len)
+
+            full50 = [c for c in survivors_25 if len(c["speech_ids"]) == segment_len]
+
+            if len(full50) == 0:
+                best = _best_longest(survivors_25)
+                chosen = best["lm_ids"]
+            elif len(full50) == 1:
+                chosen = full50[0]["lm_ids"]
+            else:
+                speech_tensor = torch.tensor([c["speech_ids"] for c in full50], device=device)
+
+                p50 = torch.sigmoid(self.discriminator50(speech_tensor))
+                p50s25 = torch.sigmoid(self.discriminator50s25(speech_tensor))
+                p50s10 = torch.sigmoid(self.discriminator50s10(speech_tensor))
+
+                combined = (w50 * p50) + (w50s25 * p50s25) + (w50s10 * p50s10)
+                best = combined.argmax().item()
+                chosen = full50[best]["lm_ids"]
+
+            output = torch.cat([output, torch.tensor([chosen], device=device)], dim=1)
+
+            if output.shape[1] >= max_length:
+                return output[:, :max_length]
+
+        return output[:, :max_length]
+
     def _infer_torch(self, prompt_ids: list[int], sampling_scheme: str = "orig") -> str:
         prompt_tensor = torch.tensor(prompt_ids).unsqueeze(0).to(self.backbone.device)
         speech_end_id = self.tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_END|>")
@@ -2103,6 +2322,34 @@ class NeuTTS:
                     top_k=50,
                     win_size=25,
                     tau_r=0.1,
+                )
+            elif sampling_scheme == "eas_hier":
+                output_tokens = self._eas_hier_generate(
+                    prompt_tensor,
+                    max_length=self.max_context,
+                    eos_token_id=speech_end_id,
+                    temperature=1.0,
+
+                    # ---- same hierarchy settings as baseline ----
+                    warmup_len=20,
+                    segment_len=50,
+                    n_beams=8,
+                    inner_beams_10=5,
+                    inner_beams_25=3,
+                    max_lm_steps=400,
+
+                    w50=1.0,
+                    w50s25=0.0,
+                    w50s10=0.0,
+
+                    # ---- EAS params (start mild) ----
+                    eas_top_k=3,
+                    alpha=0.2,          # slightly softer than standalone
+                    beta=0.7,
+                    window=15,
+                    cap=0.8,
+                    top_p=0.8,
+                    sample_top_k=50,     # IMPORTANT: smaller than 50 for stability
                 )
 
         input_length = prompt_tensor.shape[-1]
