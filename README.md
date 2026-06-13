@@ -1,8 +1,7 @@
-<p align="center">
-  <img src="assets/icon.png" alt="MSpoofTTS icon" width="96"/>
-</p>
-
-<h1 align="center">MSpoofTTS</h1>
+<h1 align="center">
+  MSpoofTTS
+  <img src="assets/icon.png" alt="MSpoofTTS icon" width="72" valign="middle"/>
+</h1>
 
 ---
 
