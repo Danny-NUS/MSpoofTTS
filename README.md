@@ -1,10 +1,12 @@
-# MSpoofTTS
-
 <p align="center">
-  <img src="assets/icon.png" alt="MSpoofTTS icon" width="160"/>
+  <img src="assets/icon.png" alt="MSpoofTTS icon" width="96"/>
 </p>
 
-<h3 align="center">Hierarchical Decoding for Discrete Speech Synthesis with Multi-Resolution Spoof Detection</h3>
+<h1 align="center">MSpoofTTS</h1>
+
+---
+
+<h2 align="center"><em>Hierarchical Decoding for Discrete Speech Synthesis with Multi-Resolution Spoof Detection</em></h2>
 
 <p align="center">
   <a href="https://www.interspeech2026.org/"><img src="https://img.shields.io/badge/INTERSPEECH-2026-0072CE" alt="INTERSPEECH 2026"></a>
@@ -35,8 +37,8 @@ Neural codec language models can synthesize high-quality speech, but inference i
 ## Setup
 
 ```bash
-git clone https://github.com/vuminhducvmd/TTSSpoofDetection.git
-cd TTSSpoofDetection
+git clone https://github.com/Danny-NUS/MSpoofTTS.git
+cd MSpoofTTS
 
 conda create -n mspooftts python=3.11 -y
 conda activate mspooftts
