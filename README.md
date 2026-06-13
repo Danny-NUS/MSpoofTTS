@@ -1,6 +1,6 @@
 <h1 align="center">
-  MSpoofTTS
   <img src="assets/icon.png" alt="MSpoofTTS icon" width="72" valign="middle"/>
+  MSpoofTTS
 </h1>
 
 ---
