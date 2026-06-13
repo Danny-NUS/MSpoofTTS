@@ -158,12 +158,21 @@ TTSSpoofDetection/
 
 ## Citation
 
+If you use MSpoofTTS, please cite our paper. Since this repository builds on NeuTTS/NeuCodec components, please also cite NeuCodec when using the codec.
+
 ```bibtex
 @article{zhao2026hierarchical,
   title={Hierarchical Decoding for Discrete Speech Synthesis with Multi-Resolution Spoof Detection},
   author={Zhao, Junchuan and Vu, Minh Duc and Wang, Ye},
   journal={arXiv preprint arXiv:2603.05373},
   year={2026}
+}
+
+@article{julian2025finite,
+  title={Finite Scalar Quantization Enables Redundant and Transmission-Robust Neural Audio Compression at Low Bit-rates},
+  author={Julian, Harry and Beeson, Rachel and Konathala, Lohith and Ulin, Johanna and Gao, Jiameng},
+  journal={arXiv preprint arXiv:2509.09550},
+  year={2025}
 }
 ```
 
