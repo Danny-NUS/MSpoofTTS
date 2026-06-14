@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <a href="https://arxiv.org/pdf/2603.05373">Paper</a> | <a href="https://danny-nus.github.io/MSpoofTTS.github.io/">Demo</a>
+  <a href="https://arxiv.org/pdf/2603.05373">Paper</a> | <a href="https://danny-nus.github.io/MSpoofTTS.github.io/">Demo</a> | <a href="https://huggingface.co/Chanson-0803/MSpoofTTS">Checkpoints</a> 
 </p>
 
 ## Overview
