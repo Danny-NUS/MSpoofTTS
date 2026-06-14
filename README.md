@@ -65,7 +65,7 @@ python -m examples.basic_example \
   --input_text "MSpoofTTS helps neural text-to-speech systems generate more reliable speech by using spoof detection signals during decoding." \
   --ref_audio samples/jo.wav \
   --ref_text samples/jo.txt \
-  --output_path output.wav
+  --output_path generated/output.wav
 ```
 
 Run MSpoofTTS-guided decoding by selecting `rank_eas_hier`. The discriminator checkpoints are downloaded automatically from [Chanson-0803/MSpoofTTS](https://huggingface.co/Chanson-0803/MSpoofTTS):
@@ -78,7 +78,7 @@ python -m examples.basic_example \
   --sampling_scheme rank_eas_hier \
   --backbone_device cuda \
   --codec_device cuda \
-  --output_path output_mspooftts.wav
+  --output_path generated/output_mspooftts.wav
 ```
 
 Python usage:
@@ -105,7 +105,7 @@ wav = tts.infer(
     ref_text,
     sampling_scheme="rank_eas_hier",
 )
-sf.write("output_mspooftts.wav", wav, 24000)
+sf.write("generated/output_mspooftts.wav", wav, 24000)
 ```
 
 Supported PyTorch decoding schemes:
@@ -144,6 +144,7 @@ TTSSpoofDetection/
 ├── assets/                 # (new) README figures and project icon
 ├── Discriminator/          # (new) MSpoofTTS discriminator modules used at inference
 ├── examples/               # Minimal command-line inference examples
+├── generated/              # ignored local inference outputs
 ├── mspooftts/              # (new) MSpoofTTS checkpoint loading utilities
 ├── neutts/                 # (modified) NeuTTS runtime; new hooks marked in neutts.py
 ├── neuttsair/              # NeuTTS-Air compatibility wrapper
