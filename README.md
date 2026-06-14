@@ -11,6 +11,7 @@
   <a href="https://www.interspeech2026.org/"><img src="https://img.shields.io/badge/INTERSPEECH-2026-0072CE" alt="INTERSPEECH 2026"></a>
   <a href="https://arxiv.org/pdf/2603.05373"><img src="https://img.shields.io/badge/arXiv-2603.05373-b31b1b" alt="arXiv 2603.05373"></a>
   <a href="https://danny-nus.github.io/MSpoofTTS.github.io/"><img src="https://img.shields.io/badge/Demo-Page-7A1FA2" alt="Demo page"></a>
+  <a href="https://huggingface.co/Chanson-0803/MSpoofTTS"><img src="https://img.shields.io/badge/Model-Checkpoints-FFD21E" alt="Model checkpoints"></a>
   <a href="https://github.com/neuphonic/neutts"><img src="https://img.shields.io/badge/Built%20on-NeuTTS--Nano-4C9A2A" alt="Built on NeuTTS-Nano"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-NeuTTS%20Open%20License%20v1.0-555555" alt="License"></a>
 </p>
