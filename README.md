@@ -62,7 +62,7 @@ The default example runs vanilla NeuTTS sampling:
 
 ```bash
 python -m examples.basic_example \
-  --input_text "MSpoofTTS improves codec-token speech synthesis at inference time." \
+  --input_text "MSpoofTTS helps neural text-to-speech systems generate more reliable speech by using spoof detection signals during decoding." \
   --ref_audio samples/jo.wav \
   --ref_text samples/jo.txt \
   --output_path output.wav
@@ -72,7 +72,7 @@ Run MSpoofTTS-guided decoding by selecting `rank_eas_hier`. The discriminator ch
 
 ```bash
 python -m examples.basic_example \
-  --input_text "MSpoofTTS improves codec-token speech synthesis at inference time." \
+  --input_text "MSpoofTTS is a training-free inference framework that improves discrete speech synthesis with multi-resolution spoof detection guided decoding." \
   --ref_audio samples/jo.wav \
   --ref_text samples/jo.txt \
   --sampling_scheme rank_eas_hier \
@@ -145,7 +145,7 @@ TTSSpoofDetection/
 ├── Discriminator/          # (new) MSpoofTTS discriminator modules used at inference
 ├── examples/               # Minimal command-line inference examples
 ├── mspooftts/              # (new) MSpoofTTS checkpoint loading utilities
-├── neutts/                 # modified NeuTTS runtime; new hooks marked in neutts.py
+├── neutts/                 # (modified) NeuTTS runtime; new hooks marked in neutts.py
 ├── neuttsair/              # NeuTTS-Air compatibility wrapper
 ├── samples/                # Reference audio/text/code samples
 ├── tests/                  # Lightweight loading/inference smoke tests

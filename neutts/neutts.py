@@ -242,17 +242,20 @@ class NeuTTS:
         self._load_codec(codec_repo, codec_device)
 
         # Load watermarker (optional)
-        try:
-            import perth
+        # try:
+        #     import perth
 
-            self.watermarker = perth.PerthImplicitWatermarker()
-        except (ImportError, AttributeError) as e:
-            warnings.warn(
-                f"Perth watermarking unavailable: {e}. "
-                "Audio will not be watermarked. "
-                "Install with: pip install perth>=0.2.0"
-            )
-            self.watermarker = None
+        #     self.watermarker = perth.PerthImplicitWatermarker()
+        # except (ImportError, AttributeError) as e:
+        #     warnings.warn(
+        #         f"Perth watermarking unavailable: {e}. "
+        #         "Audio will not be watermarked. "
+        #         "Install with: pip install perth>=0.2.0"
+        #     )
+        #     self.watermarker = None
+
+        # Perth watermarking is disabled because current resemble-perth releases do not expose the NeuTTS-expected PerthImplicitWatermarker API.
+        self.watermarker = None
 
         if use_dis or use_hier:
             # MSpoofTTS loads discriminator checkpoints lazily so vanilla NeuTTS
